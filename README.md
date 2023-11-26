@@ -36,14 +36,41 @@ docker run -d -p 8080:8080 --name my-proxy corsair
 
 This will start the proxy server on port 8080.
 
-### Environment Variables
+### Configuration
 
-- `CORSAIR_PORT`: Port to run the proxy server on (default: `8080`).
-- `CORSAIR_INTERFACE`: Network interface to listen on (default: `localhost`). This can be overridden by setting the `CORSAIR_INTERFACE` environment variable when running the Docker container.
-- `CORSAIR_DOMAINS`: Comma-separated list of allowed domains for forwarding (default: `*` for all).
-- `CORSAIR_TIMEOUT`: Timeout in seconds for HTTP client (default: `15`).
-- `CORSAIR_USE_HTTPS`: Enable HTTPS support using CertMagic (default: `false`). When enabled, the server will automatically acquire and renew TLS certificates for the domains specified in `CORSAIR_CERT_DOMAINS`.
-- `CORSAIR_CERT_DOMAINS`: Comma-separated list of domains for the TLS certificate. Required if `CORSAIR_USE_HTTPS` is set to `true`.
+The proxy server can be configured using both environment variables and command-line flags. When both are provided, command-line flags take precedence over environment variables.
+
+#### Environment Variables
+
+- `CORSAIR_PORT`: Port to run the proxy server on. Defaults to `8080` if not set.
+- `CORSAIR_INTERFACE`: Network interface to listen on. Defaults to `localhost` if not set.
+- `CORSAIR_DOMAINS`: Comma-separated list of allowed domains for forwarding. Defaults to `*` (all domains) if not set.
+- `CORSAIR_TIMEOUT`: Timeout in seconds for the HTTP client. Defaults to `15` if not set.
+- `CORSAIR_USE_HTTPS`: Set to `true` to enable HTTPS support using CertMagic. Defaults to `false` if not set.
+- `CORSAIR_CERT_DOMAINS`: Comma-separated list of domains for the TLS certificate. Required if `CORSAIR_USE_HTTPS` is `true`.
+
+#### Command-Line Flags
+
+- `--port`: Specify the port to run the proxy server on.
+- `--interface`: Specify the network interface to listen on.
+- `--domains`: Specify the allowed domains for forwarding.
+- `--timeout`: Specify the timeout in seconds for the HTTP client.
+- `--use-https`: Enable HTTPS support using CertMagic.
+- `--cert-domains`: Specify the domains for the TLS certificate.
+
+For example, to start the server on port `8081` with a timeout of `10` seconds, you can use the following command:
+
+```sh
+docker run -d -p 8081:8081 --name my-proxy corsair --port 8081 --timeout 10
+```
+
+Or, you can set the environment variables and run the container without flags:
+
+```sh
+export CORSAIR_PORT=8081
+export CORSAIR_TIMEOUT=10
+docker run -d -p 8081:8081 --name my-proxy corsair
+```
 
 ## Contributing
 
