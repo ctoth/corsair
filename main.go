@@ -61,6 +61,9 @@ func init() {
 	clientTimeout = time.Duration(timeout) * time.Second
 	client = &http.Client{
 		Timeout: clientTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return nil // This will allow the client to follow redirects.
+		},
 	}
 }
 
@@ -72,6 +75,7 @@ func main() {
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received request for %s\n", r.URL.Path) // Log every request received.
 	setCorsHeaders(w)
 
 	if r.Method == "OPTIONS" {
