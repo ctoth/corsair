@@ -1,3 +1,5 @@
+<img src="logo.png" alt="Logo" width="200"/>
+
 # Corsair
 
 This project is a simple HTTP proxy server written in Go that removes CORS (Cross-Origin Resource Sharing) restrictions by setting appropriate headers on the response.
