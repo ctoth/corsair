@@ -1,4 +1,4 @@
-# Golang CORS-Removing Proxy
+# Corsair
 
 This project is a simple HTTP proxy server written in Go that removes CORS (Cross-Origin Resource Sharing) restrictions by setting appropriate headers on the response.
 
@@ -21,7 +21,7 @@ These instructions will cover usage information for the Docker container.
 To build the Docker image, run the following command from the root of the repository:
 
 ```sh
-docker build -t cors-removing-proxy .
+docker build -t corsair .
 ```
 
 ### Running the Docker Container
@@ -29,7 +29,7 @@ docker build -t cors-removing-proxy .
 To run the proxy server in a Docker container, execute:
 
 ```sh
-docker run -d -p 8080:8080 --name my-proxy cors-removing-proxy
+docker run -d -p 8080:8080 --name my-proxy corsair
 ```
 
 This will start the proxy server on port 8080.

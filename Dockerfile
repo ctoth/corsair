@@ -15,7 +15,7 @@ RUN go get -d -v ./...
 # either manually or with a tool like "godep".)
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o app .
 
-# Use a Docker multi-stage build to create a lean production image.
+# Use a Docker multi-stage build to create a lean production image for Corsair.
 # https://docs.docker.com/develop/develop-images/multistage-build/
 FROM alpine:latest  
 
@@ -24,7 +24,7 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 
 # Copy the binary from the builder stage.
-COPY --from=builder /go/src/app/app .
+COPY --from=builder /go/src/app/corsair .
 
 # Run the binary program produced by `go install`.
-CMD ["./app"]
+CMD ["./corsair"]
