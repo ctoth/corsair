@@ -38,7 +38,7 @@ func init() {
 	var domains string
 	var timeout int
 	flag.IntVar(&port, "port", getEnvAsInt("PORT", 8080), "Port to run the proxy server on")
-	flag.StringVar(&listenAddr, "interface", getEnv("INTERFACE", "localhost"), "Network interface to listen on")
+	flag.StringVar(&listenAddr, "interface", getEnv("INTERFACE", "0.0.0.0"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("TIMEOUT", 15), "Timeout in seconds for HTTP client")
 	flag.Parse()
