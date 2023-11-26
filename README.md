@@ -37,7 +37,7 @@ This will start the proxy server on port 8080.
 ### Environment Variables
 
 - `PORT`: Port to run the proxy server on (default: `8080`).
-- `INTERFACE`: Network interface to listen on (default: `0.0.0.0`).
+- `INTERFACE`: Network interface to listen on (default: `localhost`). This can be overridden by setting the `INTERFACE` environment variable when running the Docker container.
 - `DOMAINS`: Comma-separated list of allowed domains for forwarding (default: `*` for all).
 - `TIMEOUT`: Timeout in seconds for HTTP client (default: `15`).
 
