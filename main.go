@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/caddyserver/certmagic"
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -25,6 +26,8 @@ var (
 	allowedDomains  map[string]bool
 	allowAllDomains bool
 	clientTimeout   time.Duration
+	useTLS          bool
+	certDomains     string
 	client          *http.Client
 	cache           *lru.Cache
 	cacheMutex      sync.RWMutex
@@ -72,6 +75,10 @@ func init() {
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 15), "Timeout in seconds for HTTP client")
+
+	flag.BoolVar(&useTLS, "use-https", getEnvAsBool("CORSAIR_USE_HTTPS", false), "Enable HTTPS using CertMagic")
+	flag.StringVar(&certDomains, "cert-domains", getEnv("CORSAIR_CERT_DOMAINS", ""), "Comma-separated list of domains for the TLS certificate")
+
 	flag.Parse()
 
 	allowedDomains = make(map[string]bool)
@@ -106,7 +113,16 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	address := fmt.Sprintf("%s:%d", listenAddr, port)
 	log.Printf("Proxy server started on %s\n", address)
-	log.Fatal(http.ListenAndServe(address, nil))
+
+	if useTLS {
+		if certDomains == "" {
+			log.Fatal("No domains specified for HTTPS certificate")
+		}
+		domains := strings.Split(certDomains, ",")
+		certmagic.HTTPS(domains, nil)
+	} else {
+		log.Fatal(http.ListenAndServe(address, nil))
+	}
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -308,6 +324,16 @@ func getEnvAsInt(key string, fallback int) int {
 		intValue, err := strconv.Atoi(value)
 		if err == nil {
 			return intValue
+		}
+	}
+	return fallback
+}
+
+func getEnvAsBool(key string, fallback bool) bool {
+	if value, exists := os.LookupEnv(key); exists {
+		boolValue, err := strconv.ParseBool(value)
+		if err == nil {
+			return boolValue
 		}
 	}
 	return fallback
