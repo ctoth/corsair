@@ -48,6 +48,7 @@ The proxy server can be configured using both environment variables and command-
 - `CORSAIR_TIMEOUT`: Timeout in seconds for the HTTP client. Defaults to `15` if not set.
 - `CORSAIR_USE_HTTPS`: Set to `true` to enable HTTPS support using CertMagic. Defaults to `false` if not set.
 - `CORSAIR_CERT_DOMAINS`: Comma-separated list of domains for the TLS certificate. Required if `CORSAIR_USE_HTTPS` is `true`.
+- `CORSAIR_CACHE_SIZE`: Size of the cache. Defaults to `100` if not set.
 
 #### Command-Line Flags
 

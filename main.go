@@ -28,6 +28,7 @@ var (
 	clientTimeout   time.Duration
 	useTLS          bool
 	certDomains     string
+	cacheSize       int
 	client          *http.Client
 	cache           *lru.Cache
 	cacheMutex      sync.RWMutex
@@ -79,7 +80,11 @@ func init() {
 	flag.BoolVar(&useTLS, "use-https", getEnvAsBool("CORSAIR_USE_HTTPS", false), "Enable HTTPS using CertMagic")
 	flag.StringVar(&certDomains, "cert-domains", getEnv("CORSAIR_CERT_DOMAINS", ""), "Comma-separated list of domains for the TLS certificate")
 
+	var cacheSizeEnv int
+	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
+	cacheSizeEnv = getEnvAsInt("CORSAIR_CACHE_SIZE", cacheSize)
 	flag.Parse()
+	cacheSize = cacheSizeEnv
 
 	allowedDomains = make(map[string]bool)
 	if domains == "*" {
@@ -91,7 +96,7 @@ func init() {
 	}
 
 	var err error
-	cache, err = lru.New(100) // Cache size of 100
+	cache, err = lru.New(cacheSize)
 	if err != nil {
 		log.Fatalf("Failed to create cache: %v", err)
 	}
