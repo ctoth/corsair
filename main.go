@@ -82,7 +82,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURL, err := parseTargetURL(r.URL.Path)
+	targetURL, err := parseTargetURL(r.URL.Query())
 	log.Printf("Target URL: %s\n", targetURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid target URL: %v", err), http.StatusBadRequest)
@@ -125,23 +125,20 @@ func setCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
-func parseTargetURL(path string) (string, error) {
-	// Trim the leading "/" from the path to get the target URL
-	targetURL := strings.TrimPrefix(path, "/")
-
-	// URL-decode the path
-	decodedURL, err := url.PathUnescape(targetURL)
-	if err != nil {
-		return "", fmt.Errorf("error decoding URL path: %w", err)
+func parseTargetURL(query url.Values) (string, error) {
+	// Extract the URL from the query parameter named "url"
+	targetURL := query.Get("url")
+	if targetURL == "" {
+		return "", fmt.Errorf("query parameter 'url' is missing")
 	}
 
-	// Basic validation: check if the decodedURL is not empty and is a well-formed URL
-	if decodedURL == "" {
-		return "", fmt.Errorf("target URL is empty after decoding")
+	// Basic validation: check if the targetURL is not empty and is a well-formed URL
+	if targetURL == "" {
+		return "", fmt.Errorf("target URL is empty")
 	}
 
 	// Use url.Parse to validate if the URL is well-formed
-	parsedURL, err := url.Parse(decodedURL)
+	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return "", fmt.Errorf("invalid target URL: %w", err)
 	}
