@@ -1,0 +1,61 @@
+name: Release
+
+permissions:
+    contents: write
+
+    
+on:
+  push:
+    tags:
+        - 'v*'
+
+jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Repository checkout
+      uses: actions/checkout@v3
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: ${{ github.ref }}
+        draft: false
+        prerelease: false
+  release-binaries:
+    name: Publish binaries
+    runs-on: ubuntu-latest
+    needs: release
+    strategy:
+      matrix:
+        goos:
+          - darwin
+          - linux
+          - windows
+        goarch:
+          - amd64
+          - arm
+          - arm64
+        exclude:
+          - goos: darwin
+            goarch: arm
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: arm64
+    steps:
+    - name: Repository checkout
+      uses: actions/checkout@v3
+    - name: Publish binaries
+      uses: wangyoucao577/go-release-action@v1.34
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        goos: ${{ matrix.goos }}
+        goarch: ${{ matrix.goarch }}
+        binary_name: corsair
+        extra_files: LICENSE README.md
+        md5sum: false
+        sha256sum: true
