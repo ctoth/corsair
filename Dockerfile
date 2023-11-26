@@ -21,7 +21,7 @@ FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 
-ENV INTERFACE=0.0.0.0
+ENV CORSAIR_INTERFACE=0.0.0.0
 WORKDIR /root/
 
 # Copy the binary from the builder stage.
