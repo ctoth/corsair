@@ -221,8 +221,29 @@ func isStreamingResponse(resp *http.Response) bool {
 }
 
 func copyHeaders(dst, src http.Header) {
+	// List of headers that should not be overwritten if they already exist
+	protectedHeaders := []string{"Host", "Content-Length", "Connection"}
+
+	// Helper function to check if a header is in the protected list
+	isProtectedHeader := func(header string) bool {
+		for _, protectedHeader := range protectedHeaders {
+			if strings.EqualFold(protectedHeader, header) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Copy headers from src to dst, respecting protected headers
 	for k, vv := range src {
-		dst[k] = vv
+		if !isProtectedHeader(k) {
+			dst[k] = vv
+		} else {
+			// For protected headers, only set them if they don't already exist in dst
+			if _, exists := dst[k]; !exists {
+				dst[k] = vv
+			}
+		}
 	}
 }
 
