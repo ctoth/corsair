@@ -83,6 +83,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetURL, err := parseTargetURL(r.URL.Path)
+	log.Printf("Target URL: %s\n", targetURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid target URL: %v", err), http.StatusBadRequest)
 		return
@@ -124,15 +125,32 @@ func setCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
-
 func parseTargetURL(path string) (string, error) {
-	path = strings.TrimPrefix(path, "/")
+	// Trim the leading "/" from the path to get the target URL
+	targetURL := strings.TrimPrefix(path, "/")
 
-	if _, err := url.ParseRequestURI(path); err != nil {
-		return "", err
+	// URL-decode the path
+	decodedURL, err := url.PathUnescape(targetURL)
+	if err != nil {
+		return "", fmt.Errorf("error decoding URL path: %w", err)
 	}
 
-	return path, nil
+	// Basic validation: check if the decodedURL is not empty and is a well-formed URL
+	if decodedURL == "" {
+		return "", fmt.Errorf("target URL is empty after decoding")
+	}
+
+	// Use url.Parse to validate if the URL is well-formed
+	parsedURL, err := url.Parse(decodedURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid target URL: %w", err)
+	}
+
+	// Additional checks can be added here if needed
+	// For instance, ensuring the scheme is http or https, etc.
+
+	// Return the URL as is, without any modification
+	return parsedURL.String(), nil
 }
 
 func isDomainAllowed(targetURL string) bool {
