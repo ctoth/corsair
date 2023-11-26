@@ -15,6 +15,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -25,7 +27,36 @@ var (
 	clientTimeout   time.Duration
 	client          *http.Client
 	cache           *lru.Cache
-	cacheMutex      sync.Mutex
+	cacheMutex      sync.RWMutex
+)
+
+var (
+	requestCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "corsair_requests_total",
+			Help: "Total number of processed requests.",
+		},
+		[]string{"method", "endpoint"},
+	)
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "corsair_request_duration_seconds",
+			Help: "Histogram of request durations.",
+		},
+		[]string{"endpoint"},
+	)
+	cacheHitCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "corsair_cache_hits_total",
+			Help: "Total number of cache hits.",
+		},
+	)
+	cacheMissCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "corsair_cache_misses_total",
+			Help: "Total number of cache misses.",
+		},
+	)
 )
 
 type cacheEntry struct {
@@ -65,17 +96,30 @@ func init() {
 			return nil // This will allow the client to follow redirects.
 		},
 	}
+
+	prometheus.MustRegister(requestCounter, requestDuration, cacheHitCounter, cacheMissCounter)
 }
 
 func main() {
 	http.HandleFunc("/", proxyHandler)
+	http.HandleFunc("/health", healthCheckHandler)
+	http.Handle("/metrics", promhttp.Handler())
 	address := fmt.Sprintf("%s:%d", listenAddr, port)
-	log.Printf("Proxy server started on %s with a timeout of %v\n", address, clientTimeout)
+	log.Printf("Proxy server started on %s\n", address)
 	log.Fatal(http.ListenAndServe(address, nil))
 }
 
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Received request for %s\n", r.URL.Path) // Log every request received.
+	timer := prometheus.NewTimer(requestDuration.WithLabelValues(r.URL.Path))
+	defer timer.ObserveDuration()
+
+	requestCounter.WithLabelValues(r.Method, r.URL.Path).Inc()
+
 	setCorsHeaders(w)
 
 	if r.Method == "OPTIONS" {
@@ -83,7 +127,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetURL, err := parseTargetURL(r.URL.Query())
-	log.Printf("Target URL: %s\n", targetURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid target URL: %v", err), http.StatusBadRequest)
 		return
@@ -95,10 +138,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "GET" {
-		cacheMutex.Lock()
+		cacheMutex.RLock()
 		if entry, ok := cache.Get(targetURL); ok {
+			cacheMutex.RUnlock()
 			cachedEntry, ok := entry.(cacheEntry)
-			cacheMutex.Unlock()
 			if !ok {
 				log.Printf("Cache entry type assertion failed for %s", targetURL)
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -113,10 +156,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			w.Write(cachedEntry.content)
 			return
 		}
-		cacheMutex.Unlock()
+		cacheMutex.RUnlock()
 	}
 
-	log.Printf("Forwarding request to %s\n", targetURL)
 	forwardRequest(w, r, targetURL)
 }
 
@@ -125,28 +167,18 @@ func setCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
+
 func parseTargetURL(query url.Values) (string, error) {
-	// Extract the URL from the query parameter named "url"
 	targetURL := query.Get("url")
 	if targetURL == "" {
 		return "", fmt.Errorf("query parameter 'url' is missing")
 	}
 
-	// Basic validation: check if the targetURL is not empty and is a well-formed URL
-	if targetURL == "" {
-		return "", fmt.Errorf("target URL is empty")
-	}
-
-	// Use url.Parse to validate if the URL is well-formed
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
 		return "", fmt.Errorf("invalid target URL: %w", err)
 	}
 
-	// Additional checks can be added here if needed
-	// For instance, ensuring the scheme is http or https, etc.
-
-	// Return the URL as is, without any modification
 	return parsedURL.String(), nil
 }
 
@@ -174,11 +206,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 
 	copyHeaders(req.Header, r.Header)
 
-	cacheMutex.Lock()
+	cacheMutex.RLock()
 	if entry, ok := cache.Get(targetURL); ok {
 		cachedEntry, ok := entry.(cacheEntry)
 		if !ok {
-			cacheMutex.Unlock()
+			cacheMutex.RUnlock()
 			log.Printf("Cache entry type assertion failed for %s", targetURL)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
@@ -191,7 +223,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 			req.Header.Set("If-Modified-Since", cachedEntry.lastModified)
 		}
 	}
-	cacheMutex.Unlock()
+	cacheMutex.RUnlock()
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -240,10 +272,7 @@ func isStreamingResponse(resp *http.Response) bool {
 }
 
 func copyHeaders(dst, src http.Header) {
-	// List of headers that should not be overwritten if they already exist
 	protectedHeaders := []string{"Host", "Content-Length", "Connection"}
-
-	// Helper function to check if a header is in the protected list
 	isProtectedHeader := func(header string) bool {
 		for _, protectedHeader := range protectedHeaders {
 			if strings.EqualFold(protectedHeader, header) {
@@ -253,12 +282,10 @@ func copyHeaders(dst, src http.Header) {
 		return false
 	}
 
-	// Copy headers from src to dst, respecting protected headers
 	for k, vv := range src {
 		if !isProtectedHeader(k) {
 			dst[k] = vv
 		} else {
-			// For protected headers, only set them if they don't already exist in dst
 			if _, exists := dst[k]; !exists {
 				dst[k] = vv
 			}
@@ -276,7 +303,6 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
 func getEnvAsInt(key string, fallback int) int {
 	if value, exists := os.LookupEnv(key); exists {
 		intValue, err := strconv.Atoi(value)
