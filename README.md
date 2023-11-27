@@ -48,6 +48,7 @@ The proxy server can be configured using both environment variables and command-
 - `CORSAIR_TIMEOUT`: Timeout in seconds for the HTTP client. Defaults to `15` if not set.
 - `CORSAIR_USE_HTTPS`: Set to `true` to enable HTTPS support using CertMagic. Defaults to `false` if not set.
 - `CORSAIR_CERT_DOMAINS`: Comma-separated list of domains for the TLS certificate. Required if `CORSAIR_USE_HTTPS` is `true`.
+- `CORSAIR_LETSENCRYPT_EMAIL`: Email address to use for Let's Encrypt account. Optional.
 - `CORSAIR_CACHE_SIZE`: Size of the cache. Defaults to `100` if not set.
 
 #### Command-Line Flags
@@ -59,10 +60,10 @@ The proxy server can be configured using both environment variables and command-
 - `--use-https`: Enable HTTPS support using CertMagic.
 - `--cert-domains`: Specify the domains for the TLS certificate.
 
-For example, to start the server on port `8081` with a timeout of `10` seconds, you can use the following command with environment variables:
+For example, to start the server on port `8081` with a timeout of `10` seconds and set the Let's Encrypt account email, you can use the following command with environment variables:
 
 ```sh
-docker run -d -p 8081:8081 --name my-proxy -e CORSAIR_PORT=8081 -e CORSAIR_TIMEOUT=10 corsair
+docker run -d -p 8081:8081 --name my-proxy -e CORSAIR_PORT=8081 -e CORSAIR_TIMEOUT=10 -e CORSAIR_LETSENCRYPT_EMAIL=your-email@example.com corsair
 ```
 
 Or, you can set the environment variables and run the container without flags:

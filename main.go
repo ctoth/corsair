@@ -21,17 +21,18 @@ import (
 )
 
 var (
-	port            int
-	listenAddr      string
-	allowedDomains  map[string]bool
-	allowAllDomains bool
-	clientTimeout   time.Duration
-	useTLS          bool
-	certDomains     string
-	cacheSize       int
+	port             int
+	listenAddr       string
+	allowedDomains   map[string]bool
+	allowAllDomains  bool
+	clientTimeout    time.Duration
+	useTLS           bool
+	certDomains      string
+	letsEncryptEmail string // New variable for Let's Encrypt account email
+	cacheSize        int
 	client          *http.Client
-	cache           *lru.Cache
-	cacheMutex      sync.RWMutex
+	cache            *lru.Cache
+	cacheMutex       sync.RWMutex
 )
 
 var (
@@ -79,6 +80,7 @@ func init() {
 
 	flag.BoolVar(&useTLS, "use-https", getEnvAsBool("CORSAIR_USE_HTTPS", false), "Enable HTTPS using CertMagic")
 	flag.StringVar(&certDomains, "cert-domains", getEnv("CORSAIR_CERT_DOMAINS", ""), "Comma-separated list of domains for the TLS certificate")
+	flag.StringVar(&letsEncryptEmail, "letsencrypt-email", getEnv("CORSAIR_LETSENCRYPT_EMAIL", ""), "Email address to use for Let's Encrypt account")
 
 	var cacheSizeEnv int
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
@@ -120,6 +122,7 @@ func main() {
 	log.Printf("Proxy server started on %s\n", address)
 
 	if useTLS {
+		certmagic.DefaultACME.Email = letsEncryptEmail // Set the Let's Encrypt account email
 		if certDomains == "" {
 			log.Fatal("No domains specified for HTTPS certificate")
 		}
