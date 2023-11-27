@@ -117,6 +117,7 @@ func init() {
 func main() {
 	http.HandleFunc("/", proxyHandler)
 	http.HandleFunc("/health", healthCheckHandler)
+	http.HandleFunc("/favicon.ico", faviconHandler) // New handler for favicon.ico
 	http.Handle("/metrics", promhttp.Handler())
 	address := fmt.Sprintf("%s:%d", listenAddr, port)
 	log.Printf("Proxy server started on %s\n", address)
@@ -136,6 +137,11 @@ func main() {
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+// faviconHandler responds to /favicon.ico requests
+func faviconHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent) // Respond with 204 No Content
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
