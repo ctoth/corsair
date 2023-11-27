@@ -59,10 +59,10 @@ The proxy server can be configured using both environment variables and command-
 - `--use-https`: Enable HTTPS support using CertMagic.
 - `--cert-domains`: Specify the domains for the TLS certificate.
 
-For example, to start the server on port `8081` with a timeout of `10` seconds, you can use the following command:
+For example, to start the server on port `8081` with a timeout of `10` seconds, you can use the following command with environment variables:
 
 ```sh
-docker run -d -p 8081:8081 --name my-proxy corsair --port 8081 --timeout 10
+docker run -d -p 8081:8081 --name my-proxy -e CORSAIR_PORT=8081 -e CORSAIR_TIMEOUT=10 corsair
 ```
 
 Or, you can set the environment variables and run the container without flags:
