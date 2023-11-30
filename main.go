@@ -27,6 +27,7 @@ var (
 	allowAllDomains  bool
 	clientTimeout    time.Duration
 	useTLS           bool
+	useStagingCa     bool
 	certDomains      string
 	tlsChallengePort int
 	letsEncryptEmail string
@@ -81,6 +82,7 @@ func init() {
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 15), "Timeout in seconds for HTTP client")
 
 	flag.BoolVar(&useTLS, "use-https", getEnvAsBool("CORSAIR_USE_HTTPS", false), "Enable HTTPS using CertMagic")
+	flag.BoolVar(&useStagingCa, "use-staging-ca", getEnvAsBool("CORSAIR_USE_STAGING_CA", false), "Use the Let's Encrypt staging CA")
 	flag.StringVar(&certDomains, "cert-domains", getEnv("CORSAIR_CERT_DOMAINS", ""), "Comma-separated list of domains for the TLS certificate")
 	flag.StringVar(&letsEncryptEmail, "letsencrypt-email", getEnv("CORSAIR_LETSENCRYPT_EMAIL", ""), "Email address to use for Let's Encrypt account")
 
@@ -127,12 +129,16 @@ func main() {
 	if useTLS {
 		certmagic.DefaultACME.Email = letsEncryptEmail // Set the Let's Encrypt account email
 		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+		if useStagingCa {
+			certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
+		}
 		certmagic.DefaultACME.AltHTTPPort = tlsChallengePort
+		certmagic.DefaultACME.DisableTLSALPNChallenge = true
+		certmagic.DefaultACME.DisableHTTPChallenge = false
 		if certDomains == "" {
 			log.Fatal("No domains specified for HTTPS certificate")
 		}
 		domains := strings.Split(certDomains, ",")
-		certmagic.DefaultACME.AltHTTPPort = port
 		certmagic.HTTPS(domains, nil)
 	} else {
 		log.Fatal(http.ListenAndServe(address, nil))
