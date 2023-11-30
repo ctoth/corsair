@@ -28,9 +28,10 @@ var (
 	clientTimeout    time.Duration
 	useTLS           bool
 	certDomains      string
-	letsEncryptEmail string // New variable for Let's Encrypt account email
+	tlsChallengePort int
+	letsEncryptEmail string
 	cacheSize        int
-	client          *http.Client
+	client           *http.Client
 	cache            *lru.Cache
 	cacheMutex       sync.RWMutex
 )
@@ -74,6 +75,7 @@ func init() {
 	var domains string
 	var timeout int
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
+	flag.IntVar(&tlsChallengePort, "tls-challenge-port", getEnvAsInt("CORSAIR_TLS_CHALLENGE_PORT", 8081), "Port to run the TLS challenge server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 15), "Timeout in seconds for HTTP client")
@@ -124,10 +126,13 @@ func main() {
 
 	if useTLS {
 		certmagic.DefaultACME.Email = letsEncryptEmail // Set the Let's Encrypt account email
+		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+		certmagic.DefaultACME.AltHTTPPort = tlsChallengePort
 		if certDomains == "" {
 			log.Fatal("No domains specified for HTTPS certificate")
 		}
 		domains := strings.Split(certDomains, ",")
+		certmagic.DefaultACME.AltHTTPPort = port
 		certmagic.HTTPS(domains, nil)
 	} else {
 		log.Fatal(http.ListenAndServe(address, nil))
