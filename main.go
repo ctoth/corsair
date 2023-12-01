@@ -21,6 +21,9 @@ import (
 )
 
 var (
+	Version          = "dev"
+	GitCommit        = "none"
+	BuildDate        = "unknown"
 	port             int
 	listenAddr       string
 	allowedDomains   map[string]bool
@@ -139,7 +142,7 @@ func main() {
 			log.Fatal("No domains specified for HTTPS certificate")
 		}
 		domains := strings.Split(certDomains, ",")
-		certmagic.HTTPS(domains, nil)
+		certmagic.TLS(domains)
 	} else {
 		log.Fatal(http.ListenAndServe(address, nil))
 	}
