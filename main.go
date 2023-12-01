@@ -24,6 +24,7 @@ var (
 	Version          = "dev"
 	GitCommit        = "none"
 	BuildDate        = "unknown"
+	shoVersion       bool
 	port             int
 	listenAddr       string
 	allowedDomains   map[string]bool
@@ -78,6 +79,7 @@ type cacheEntry struct {
 func init() {
 	var domains string
 	var timeout int
+	flag.BoolVar(&shoVersion, "version", false, "Show version information")
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
 	flag.IntVar(&tlsChallengePort, "tls-challenge-port", getEnvAsInt("CORSAIR_TLS_CHALLENGE_PORT", 8081), "Port to run the TLS challenge server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
@@ -93,6 +95,14 @@ func init() {
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
 	cacheSizeEnv = getEnvAsInt("CORSAIR_CACHE_SIZE", cacheSize)
 	flag.Parse()
+	if shoVersion {
+		fmt.Printf("Version: %s\n", Version)
+		fmt.Printf("Git commit: %s\n", GitCommit)
+		fmt.Printf("Build date: %s\n", BuildDate)
+
+		os.Exit(0)
+	}
+
 	cacheSize = cacheSizeEnv
 
 	allowedDomains = make(map[string]bool)
