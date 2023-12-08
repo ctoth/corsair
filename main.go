@@ -14,31 +14,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caddyserver/certmagic"
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	Version          = "dev"
-	GitCommit        = "none"
-	BuildDate        = "unknown"
-	shoVersion       bool
-	port             int
-	listenAddr       string
-	allowedDomains   map[string]bool
-	allowAllDomains  bool
-	clientTimeout    time.Duration
-	useTLS           bool
-	useStagingCa     bool
-	certDomains      string
-	tlsChallengePort int
-	letsEncryptEmail string
-	cacheSize        int
-	client           *http.Client
-	cache            *lru.Cache
-	cacheMutex       sync.RWMutex
+	Version         = "dev"
+	GitCommit       = "none"
+	BuildDate       = "unknown"
+	shoVersion      bool
+	port            int
+	listenAddr      string
+	allowedDomains  map[string]bool
+	allowAllDomains bool
+	clientTimeout   time.Duration
+	cacheSize       int
+	client          *http.Client
+	cache           *lru.Cache
+	cacheMutex      sync.RWMutex
 )
 
 var (
@@ -81,16 +75,9 @@ func init() {
 	var timeout int
 	flag.BoolVar(&shoVersion, "version", false, "Show version information")
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
-	flag.IntVar(&tlsChallengePort, "tls-challenge-port", getEnvAsInt("CORSAIR_TLS_CHALLENGE_PORT", 8081), "Port to run the TLS challenge server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 15), "Timeout in seconds for HTTP client")
-
-	flag.BoolVar(&useTLS, "use-https", getEnvAsBool("CORSAIR_USE_HTTPS", false), "Enable HTTPS using CertMagic")
-	flag.BoolVar(&useStagingCa, "use-staging-ca", getEnvAsBool("CORSAIR_USE_STAGING_CA", false), "Use the Let's Encrypt staging CA")
-	flag.StringVar(&certDomains, "cert-domains", getEnv("CORSAIR_CERT_DOMAINS", ""), "Comma-separated list of domains for the TLS certificate")
-	flag.StringVar(&letsEncryptEmail, "letsencrypt-email", getEnv("CORSAIR_LETSENCRYPT_EMAIL", ""), "Email address to use for Let's Encrypt account")
-
 	var cacheSizeEnv int
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
 	cacheSizeEnv = getEnvAsInt("CORSAIR_CACHE_SIZE", cacheSize)
@@ -103,8 +90,11 @@ func init() {
 		os.Exit(0)
 	}
 
-	cacheSize = cacheSizeEnv
+	if cacheSizeEnv < 1 {
+		log.Fatalf("Invalid cache size: %d", cacheSizeEnv)
+	}
 
+	cacheSize = cacheSizeEnv
 	allowedDomains = make(map[string]bool)
 	if domains == "*" {
 		allowAllDomains = true
@@ -138,24 +128,8 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	address := fmt.Sprintf("%s:%d", listenAddr, port)
 	log.Printf("Proxy server started on %s\n", address)
+	log.Fatal(http.ListenAndServe(address, nil))
 
-	if useTLS {
-		certmagic.DefaultACME.Email = letsEncryptEmail // Set the Let's Encrypt account email
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
-		if useStagingCa {
-			certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
-		}
-		certmagic.DefaultACME.AltHTTPPort = tlsChallengePort
-		certmagic.DefaultACME.DisableTLSALPNChallenge = true
-		certmagic.DefaultACME.DisableHTTPChallenge = false
-		if certDomains == "" {
-			log.Fatal("No domains specified for HTTPS certificate")
-		}
-		domains := strings.Split(certDomains, ",")
-		certmagic.TLS(domains)
-	} else {
-		log.Fatal(http.ListenAndServe(address, nil))
-	}
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -362,16 +336,6 @@ func getEnvAsInt(key string, fallback int) int {
 		intValue, err := strconv.Atoi(value)
 		if err == nil {
 			return intValue
-		}
-	}
-	return fallback
-}
-
-func getEnvAsBool(key string, fallback bool) bool {
-	if value, exists := os.LookupEnv(key); exists {
-		boolValue, err := strconv.ParseBool(value)
-		if err == nil {
-			return boolValue
 		}
 	}
 	return fallback
