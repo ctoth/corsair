@@ -281,6 +281,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 
 		w.Write(bodyBytes)
 	} else {
+		log.Printf("Streaming response for %s", targetURL)
 		io.Copy(w, resp.Body)
 	}
 }
