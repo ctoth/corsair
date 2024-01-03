@@ -77,7 +77,7 @@ func init() {
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
-	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 15), "Timeout in seconds for HTTP client")
+	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 0), "Timeout in seconds for HTTP client")
 	var cacheSizeEnv int
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
 	cacheSizeEnv = getEnvAsInt("CORSAIR_CACHE_SIZE", cacheSize)
@@ -282,7 +282,10 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 		w.Write(bodyBytes)
 	} else {
 		log.Printf("Streaming response for %s", targetURL)
-		io.Copy(w, resp.Body)
+		_, copyErr := io.Copy(w, resp.Body)
+		if copyErr != nil {
+			log.Printf("Error streaming response for %s: %v", targetURL, copyErr)
+		}
 	}
 }
 
