@@ -2,69 +2,168 @@
 
 # Corsair
 
-This project is a simple HTTP proxy server written in Go that removes CORS (Cross-Origin Resource Sharing) restrictions by setting appropriate headers on the response.
+Corsair is a high-performance HTTP proxy server written in Go that enables cross-origin requests by handling CORS headers. It acts as an intermediary between your frontend application and APIs that don't support CORS, allowing you to make requests to any domain while maintaining security and performance.
 
 ## Features
 
-- Removes CORS restrictions for client-side cross-origin requests.
-- Caches responses to improve performance.
-- Configurable through environment variables.
+- **CORS Handling**: Automatically adds appropriate CORS headers to enable cross-origin requests
+- **Smart Caching**: Built-in LRU cache with ETag and Last-Modified support
+- **Performance Monitoring**: Prometheus metrics for request tracking and performance analysis
+- **Streaming Support**: Handles streaming responses for video/audio content
+- **Flexible Configuration**: Configurable via both environment variables and command-line flags
+- **Health Checks**: Built-in health check endpoint
+- **Domain Filtering**: Optional whitelist of allowed domains
+- **Redirect Handling**: Properly follows HTTP redirects
+- **Request Forwarding**: Preserves headers and request methods
 
 ## Getting Started
 
-These instructions will cover usage information for the Docker container.
+You can run Corsair either directly as a Go binary or using Docker.
 
 ### Prerequisites
 
+#### For Docker
 - Docker
 
-### Building the Docker Image
+#### For Direct Installation
+- Go 1.16 or higher
+- Git
 
-To build the Docker image, run the following command from the root of the repository:
+### Installation
 
+#### Using Docker
+
+1. Build the image:
 ```sh
 docker build -t corsair .
 ```
 
-### Running the Docker Container
-
-To run the proxy server in a Docker container, execute:
-
+2. Run the container:
 ```sh
-docker run -d -p 8080:8080 --name my-proxy corsair
+docker run -d -p 8080:8080 --name corsair corsair
 ```
 
-This will start the proxy server on port 8080.
+#### Using Go
+
+1. Clone the repository:
+```sh
+git clone https://github.com/yourusername/corsair.git
+cd corsair
+```
+
+2. Build the binary:
+```sh
+go build -o corsair
+```
+
+3. Run the server:
+```sh
+./corsair
+```
+
+## Usage
+
+### Basic Usage
+
+To proxy a request through Corsair, add your target URL as a query parameter:
+
+```
+http://localhost:8080/?url=https://api.example.com/data
+```
+
+### API Documentation
+
+#### Main Proxy Endpoint (/)
+- Method: GET, POST, OPTIONS
+- Query Parameters:
+  - `url`: (Required) The target URL to proxy
+- Example: `curl "http://localhost:8080/?url=https://api.example.com/data"`
+
+#### Health Check (/health)
+- Method: GET
+- Returns: 200 OK when service is healthy
+- Example: `curl http://localhost:8080/health`
+
+#### Metrics (/metrics)
+- Method: GET
+- Returns: Prometheus metrics
+- Example: `curl http://localhost:8080/metrics`
 
 ### Configuration
 
-The proxy server can be configured using both environment variables and command-line flags. When both are provided, command-line flags take precedence over environment variables.
+Corsair can be configured through environment variables or command-line flags. Flags take precedence over environment variables.
 
 #### Environment Variables
 
-- `CORSAIR_PORT`: Port to run the proxy server on. Defaults to `8080` if not set.
-- `CORSAIR_INTERFACE`: Network interface to listen on. Defaults to `localhost` if not set.
-- `CORSAIR_DOMAINS`: Comma-separated list of allowed domains for forwarding. Defaults to `*` (all domains) if not set.
-- `CORSAIR_TIMEOUT`: Timeout in seconds for the HTTP client. Defaults to `15` if not set.
-- `CORSAIR_CACHE_SIZE`: Size of the cache. Defaults to `100` if not set.
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `CORSAIR_PORT` | Server port | 8080 | `8081` |
+| `CORSAIR_INTERFACE` | Network interface | localhost | `0.0.0.0` |
+| `CORSAIR_DOMAINS` | Allowed domains (comma-separated) | * | `api1.com,api2.com` |
+| `CORSAIR_TIMEOUT` | Client timeout (seconds) | 15 | `30` |
+| `CORSAIR_CACHE_SIZE` | LRU cache size | 100 | `1000` |
 
 #### Command-Line Flags
 
-- `--port`: Specify the port to run the proxy server on.
-- `--interface`: Specify the network interface to listen on.
-- `--domains`: Specify the allowed domains for forwarding.
-- `--timeout`: Specify the timeout in seconds for the HTTP client.
+| Flag | Description | Default | Example |
+|------|-------------|---------|---------|
+| `--port` | Server port | 8080 | `--port 8081` |
+| `--interface` | Network interface | localhost | `--interface 0.0.0.0` |
+| `--domains` | Allowed domains | * | `--domains api1.com,api2.com` |
+| `--timeout` | Client timeout | 15 | `--timeout 30` |
+| `--cache-size` | LRU cache size | 100 | `--cache-size 1000` |
+| `--version` | Show version info | false | `--version` |
 
-For example, to start the server on port `8081` with a timeout of `10` seconds you can use the following command with environment variables:
+### Monitoring
+
+Corsair exposes Prometheus metrics at `/metrics` including:
+
+- `corsair_requests_total`: Total number of processed requests
+- `corsair_request_duration_seconds`: Request duration histogram
+- `corsair_cache_hits_total`: Cache hit count
+- `corsair_cache_misses_total`: Cache miss count
+
+### Troubleshooting
+
+#### Common Issues
+
+1. **Connection Refused**
+   - Check if the port is already in use
+   - Verify firewall settings
+   - Ensure correct interface binding
+
+2. **Domain Not Allowed**
+   - Check `CORSAIR_DOMAINS` configuration
+   - Verify target URL format
+
+3. **Timeout Errors**
+   - Increase `CORSAIR_TIMEOUT` value
+   - Check target API responsiveness
+
+#### Debug Logging
+
+Run with environment variable `DEBUG=1` for verbose logging:
 
 ```sh
-docker run -d -p 8081:8081 --name my-proxy -e CORSAIR_PORT=8081 -e CORSAIR_TIMEOUT=10 corsair
+DEBUG=1 ./corsair
 ```
 
 ## Contributing
 
-Please feel free to contribute to this project. Pull requests are welcome.
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built with [Go](https://golang.org/)
+- Uses [hashicorp/golang-lru](https://github.com/hashicorp/golang-lru) for caching
+- Metrics powered by [Prometheus](https://prometheus.io/)
