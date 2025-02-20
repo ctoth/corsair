@@ -305,9 +305,21 @@ func isStreamingResponse(resp *http.Response) bool {
 
 func copyHeaders(dst, src http.Header) {
 	protectedHeaders := []string{"Host", "Content-Length", "Connection"}
+	// CORS headers that we want to ignore from upstream
+	corsHeaders := []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers"}
+
 	isProtectedHeader := func(header string) bool {
-		for _, protectedHeader := range protectedHeaders {
-			if strings.EqualFold(protectedHeader, header) {
+		for _, h := range protectedHeaders {
+			if strings.EqualFold(h, header) {
+				return true
+			}
+		}
+		return false
+	}
+
+	isCorsHeader := func(header string) bool {
+		for _, h := range corsHeaders {
+			if strings.EqualFold(h, header) {
 				return true
 			}
 		}
@@ -315,6 +327,9 @@ func copyHeaders(dst, src http.Header) {
 	}
 
 	for k, vv := range src {
+		if isCorsHeader(k) {
+			continue // Skip copying upstream CORS headers.
+		}
 		if !isProtectedHeader(k) {
 			dst[k] = vv
 		} else {
@@ -326,7 +341,11 @@ func copyHeaders(dst, src http.Header) {
 }
 
 func matchHeader(r *http.Request, headerName, headerValue string) bool {
-	return r.Header.Get(headerName) == headerValue
+	h := r.Header.Get(headerName)
+	if h == "" {
+		return false
+	}
+	return h == headerValue
 }
 
 func getEnv(key, fallback string) string {
