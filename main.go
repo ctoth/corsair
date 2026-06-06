@@ -26,8 +26,10 @@ var (
 	shoVersion      bool
 	port            int
 	listenAddr      string
+	domains         string
 	allowedDomains  map[string]bool
 	allowAllDomains bool
+	timeout         int
 	clientTimeout   time.Duration
 	cacheSize       int
 	client          *http.Client
@@ -66,22 +68,36 @@ var (
 
 type cacheEntry struct {
 	content      []byte
+	headers      http.Header
+	statusCode   int
 	etag         string
 	lastModified string
 }
 
 func init() {
-	var domains string
-	var timeout int
 	flag.BoolVar(&shoVersion, "version", false, "Show version information")
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
 	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 0), "Timeout in seconds for HTTP client")
-	var cacheSizeEnv int
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
-	cacheSizeEnv = getEnvAsInt("CORSAIR_CACHE_SIZE", cacheSize)
+
+	prometheus.MustRegister(requestCounter, requestDuration, cacheHitCounter, cacheMissCounter)
+}
+
+func main() {
 	flag.Parse()
+	configure()
+	http.HandleFunc("/", proxyHandler)
+	http.HandleFunc("/health", healthCheckHandler)
+	http.HandleFunc("/favicon.ico", faviconHandler) // New handler for favicon.ico
+	http.Handle("/metrics", promhttp.Handler())
+	address := fmt.Sprintf("%s:%d", listenAddr, port)
+	log.Printf("Proxy server started on %s\n", address)
+	log.Fatal(http.ListenAndServe(address, nil))
+}
+
+func configure() {
 	if shoVersion {
 		fmt.Printf("Version: %s\n", Version)
 		fmt.Printf("Git commit: %s\n", GitCommit)
@@ -90,12 +106,12 @@ func init() {
 		os.Exit(0)
 	}
 
-	if cacheSizeEnv < 1 {
-		log.Fatalf("Invalid cache size: %d", cacheSizeEnv)
+	if cacheSize < 1 {
+		log.Fatalf("Invalid cache size: %d", cacheSize)
 	}
 
-	cacheSize = cacheSizeEnv
 	allowedDomains = make(map[string]bool)
+	allowAllDomains = false
 	if domains == "*" {
 		allowAllDomains = true
 	} else {
@@ -117,19 +133,6 @@ func init() {
 			return nil // This will allow the client to follow redirects.
 		},
 	}
-
-	prometheus.MustRegister(requestCounter, requestDuration, cacheHitCounter, cacheMissCounter)
-}
-
-func main() {
-	http.HandleFunc("/", proxyHandler)
-	http.HandleFunc("/health", healthCheckHandler)
-	http.HandleFunc("/favicon.ico", faviconHandler) // New handler for favicon.ico
-	http.Handle("/metrics", promhttp.Handler())
-	address := fmt.Sprintf("%s:%d", listenAddr, port)
-	log.Printf("Proxy server started on %s\n", address)
-	log.Fatal(http.ListenAndServe(address, nil))
-
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -165,10 +168,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == "GET" {
+	useCache := isCacheableRequest(r)
+	if useCache {
 		cacheMutex.RLock()
 		if entry, ok := cache.Get(targetURL); ok {
 			cacheMutex.RUnlock()
+			cacheHitCounter.Inc()
 			cachedEntry, ok := entry.(cacheEntry)
 			if !ok {
 				log.Printf("Cache entry type assertion failed for %s", targetURL)
@@ -177,17 +182,21 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if matchHeader(r, "If-None-Match", cachedEntry.etag) || matchHeader(r, "If-Modified-Since", cachedEntry.lastModified) {
+				copyHeaders(w.Header(), cachedEntry.headers)
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
 
+			copyHeaders(w.Header(), cachedEntry.headers)
+			w.WriteHeader(cachedEntry.statusCode)
 			w.Write(cachedEntry.content)
 			return
 		}
 		cacheMutex.RUnlock()
+		cacheMissCounter.Inc()
 	}
 
-	forwardRequest(w, r, targetURL)
+	forwardRequest(w, r, targetURL, useCache)
 }
 
 func setCorsHeaders(w http.ResponseWriter) {
@@ -225,7 +234,7 @@ func isDomainAllowed(targetURL string) bool {
 	return ok
 }
 
-func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
+func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, useCache bool) {
 	req, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error creating new request: %v", err), http.StatusInternalServerError)
@@ -234,24 +243,26 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 
 	copyHeaders(req.Header, r.Header)
 
-	cacheMutex.RLock()
-	if entry, ok := cache.Get(targetURL); ok {
-		cachedEntry, ok := entry.(cacheEntry)
-		if !ok {
-			cacheMutex.RUnlock()
-			log.Printf("Cache entry type assertion failed for %s", targetURL)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+	if useCache {
+		cacheMutex.RLock()
+		if entry, ok := cache.Get(targetURL); ok {
+			cachedEntry, ok := entry.(cacheEntry)
+			if !ok {
+				cacheMutex.RUnlock()
+				log.Printf("Cache entry type assertion failed for %s", targetURL)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
 
-		if cachedEntry.etag != "" {
-			req.Header.Set("If-None-Match", cachedEntry.etag)
+			if cachedEntry.etag != "" {
+				req.Header.Set("If-None-Match", cachedEntry.etag)
+			}
+			if cachedEntry.lastModified != "" {
+				req.Header.Set("If-Modified-Since", cachedEntry.lastModified)
+			}
 		}
-		if cachedEntry.lastModified != "" {
-			req.Header.Set("If-Modified-Since", cachedEntry.lastModified)
-		}
+		cacheMutex.RUnlock()
 	}
-	cacheMutex.RUnlock()
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -263,7 +274,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	if r.Method == "GET" && !isStreamingResponse(resp) {
+	if useCache && isCacheableResponse(resp) && !isStreamingResponse(resp) {
 		bodyBytes, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			log.Printf("Error reading response body: %v", err)
@@ -274,6 +285,8 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 		cacheMutex.Lock()
 		cache.Add(targetURL, cacheEntry{
 			content:      bodyBytes,
+			headers:      cloneHeaders(resp.Header),
+			statusCode:   resp.StatusCode,
 			etag:         resp.Header.Get("ETag"),
 			lastModified: resp.Header.Get("Last-Modified"),
 		})
@@ -289,6 +302,33 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
 	}
 }
 
+func isCacheableRequest(r *http.Request) bool {
+	if r.Method != "GET" {
+		return false
+	}
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Range") != "" {
+		return false
+	}
+	return true
+}
+
+func isCacheableResponse(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Vary") != "" {
+		return false
+	}
+	cacheControl := strings.ToLower(resp.Header.Get("Cache-Control"))
+	for _, directive := range strings.Split(cacheControl, ",") {
+		switch strings.TrimSpace(directive) {
+		case "private", "no-store", "no-cache":
+			return false
+		}
+	}
+	return true
+}
+
 func isStreamingResponse(resp *http.Response) bool {
 	if _, ok := resp.Header["Content-Length"]; !ok {
 		return true
@@ -301,6 +341,14 @@ func isStreamingResponse(resp *http.Response) bool {
 		return true
 	}
 	return false
+}
+
+func cloneHeaders(headers http.Header) http.Header {
+	cloned := make(http.Header, len(headers))
+	for key, values := range headers {
+		cloned[key] = append([]string(nil), values...)
+	}
+	return cloned
 }
 
 func copyHeaders(dst, src http.Header) {
