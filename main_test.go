@@ -152,6 +152,7 @@ func TestCachedPodcastFeedPreservesResponseHeaders(t *testing.T) {
 		w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.Header().Set("ETag", `"feed-v1"`)
+		w.Header().Set("Cache-Control", "max-age=60") // only fresh responses are cached
 		fmt.Fprint(w, body)
 	}))
 	defer upstream.Close()
@@ -940,5 +941,276 @@ func TestUpstreamFailureAfterHeadersAbortsTheResponse(t *testing.T) {
 				t.Fatalf("body = %q, want only the upstream bytes", body)
 			}
 		})
+	}
+}
+
+func TestTruncatedCacheableBodyIsA502AndNotCached(t *testing.T) {
+	resetProxyState(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("Content-Length", "100")
+		io.WriteString(w, "partial")
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	resp, body := doProxy(t, proxy, "GET", upstream.URL+"/data.json", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %q, want 502", resp.StatusCode, body)
+	}
+	if entries, bytes := cache.stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("cache holds %d entries / %d bytes, want none", entries, bytes)
+	}
+}
+
+// setClock pins the proxy's clock for cache-freshness tests.
+func setClock(t *testing.T, at *time.Time) {
+	t.Helper()
+	nowFunc = func() time.Time { return *at }
+	t.Cleanup(func() { nowFunc = time.Now })
+}
+
+// countingOrigin serves body with the given headers and counts requests.
+func countingOrigin(body string, headers map[string]string) (*httptest.Server, *int32) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		io.WriteString(w, body)
+	}))
+	return server, &hits
+}
+
+func fetchTwice(t *testing.T, proxy *httptest.Server, target, wantBody string) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		resp, body := doProxy(t, proxy, "GET", target, nil)
+		if resp.StatusCode != http.StatusOK || body != wantBody {
+			t.Fatalf("fetch %d: status = %d, body length %d, want %d", i, resp.StatusCode, len(body), len(wantBody))
+		}
+	}
+}
+
+func TestResponsesWithoutFreshnessAreNotCached(t *testing.T) {
+	resetProxyState(t)
+
+	origin, hits := countingOrigin("feed", map[string]string{"Content-Type": "application/rss+xml", "ETag": `"x"`})
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	fetchTwice(t, proxy, origin.URL+"/feed.xml", "feed")
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2 (no max-age/Expires means no caching)", got)
+	}
+	if entries, bytes := cache.stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("cache holds %d entries / %d bytes, want none", entries, bytes)
+	}
+}
+
+func TestCachedEntryExpiresAndRevalidatesWith304Merge(t *testing.T) {
+	resetProxyState(t)
+	clock := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	setClock(t, &clock)
+
+	var hits int32
+	var lastIfNoneMatch atomic.Value
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		lastIfNoneMatch.Store(r.Header.Get("If-None-Match"))
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("ETag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.Header().Set("X-Revision", "2")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("X-Revision", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "9")
+		io.WriteString(w, `{"a":"b"}`)
+	}))
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/data.json"
+
+	expect := func(step string, advance time.Duration, headers map[string]string, status int, body, revision string, wantHits int32) {
+		t.Helper()
+		clock = clock.Add(advance)
+		resp, got := doProxy(t, proxy, "GET", target, headers)
+		if resp.StatusCode != status || got != body {
+			t.Fatalf("%s: status = %d body = %q, want %d %q", step, resp.StatusCode, got, status, body)
+		}
+		if got := resp.Header.Get("X-Revision"); got != revision {
+			t.Fatalf("%s: X-Revision = %q, want %q (origin hits %d)", step, got, revision, atomic.LoadInt32(&hits))
+		}
+		if h := atomic.LoadInt32(&hits); h != wantHits {
+			t.Fatalf("%s: origin hits = %d, want %d", step, h, wantHits)
+		}
+	}
+
+	expect("initial fetch", 0, nil, 200, `{"a":"b"}`, "1", 1)
+	expect("fresh hit", 30*time.Second, nil, 200, `{"a":"b"}`, "1", 1)
+	expect("fresh conditional hit", 0, map[string]string{"If-None-Match": `"v1"`}, 304, "", "1", 1)
+
+	expect("stale revalidation", 31*time.Second, nil, 200, `{"a":"b"}`, "2", 2)
+	if got := lastIfNoneMatch.Load(); got != `"v1"` {
+		t.Fatalf("revalidation sent If-None-Match %q, want the stored ETag", got)
+	}
+	expect("fresh after revalidation", 59*time.Second, nil, 200, `{"a":"b"}`, "2", 2)
+	expect("stale again", 2*time.Second, nil, 200, `{"a":"b"}`, "2", 3)
+}
+
+func TestExpiresHeaderBoundsFreshness(t *testing.T) {
+	resetProxyState(t)
+	clock := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	setClock(t, &clock)
+
+	origin, hits := countingOrigin("expiring", map[string]string{
+		"Content-Type": "text/plain",
+		"Date":         clock.Format(http.TimeFormat),
+		"Expires":      clock.Add(30 * time.Second).Format(http.TimeFormat),
+	})
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/e.txt"
+
+	fetchTwice(t, proxy, target, "expiring")
+	if got := atomic.LoadInt32(hits); got != 1 {
+		t.Fatalf("origin hits = %d, want 1 while fresh", got)
+	}
+	clock = clock.Add(31 * time.Second)
+	fetchTwice(t, proxy, target, "expiring")
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2 after expiry", got)
+	}
+}
+
+func TestOversizedResponsesStreamWithoutCaching(t *testing.T) {
+	resetProxyState(t)
+
+	big := strings.Repeat("x", maxCacheEntryBytes+1)
+	origin, hits := countingOrigin(big, map[string]string{"Content-Type": "application/octet-stream", "Cache-Control": "max-age=60"})
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	fetchTwice(t, proxy, origin.URL+"/big.bin", big)
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2", got)
+	}
+	if entries, bytes := cache.stats(); entries != 0 || bytes != 0 {
+		t.Fatalf("cache holds %d entries / %d bytes, want none", entries, bytes)
+	}
+}
+
+func TestMediaAndManifestsBypassTheCache(t *testing.T) {
+	cases := []struct {
+		name        string
+		path        string
+		contentType string
+	}{
+		{"audio", "/a.mp3", "audio/mpeg"},
+		{"video", "/v.mp4", "video/mp4"},
+		{"HLS manifest", "/list", "application/vnd.apple.mpegurl"},
+		{"HLS manifest x-", "/list", "application/x-mpegURL"},
+		{"DASH manifest", "/list", "application/dash+xml"},
+		{"m3u8 by path", "/live/index.m3u8", "text/plain"},
+		{"mpd by path", "/live/manifest.mpd", "application/xml"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetProxyState(t)
+			origin, hits := countingOrigin("#EXTM3U", map[string]string{"Content-Type": tc.contentType, "Cache-Control": "max-age=60"})
+			defer origin.Close()
+			proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+			defer proxy.Close()
+
+			fetchTwice(t, proxy, origin.URL+tc.path, "#EXTM3U")
+			if got := atomic.LoadInt32(hits); got != 2 {
+				t.Fatalf("origin hits = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestIfRangeRequestsBypassTheCache(t *testing.T) {
+	resetProxyState(t)
+
+	origin, hits := countingOrigin("document", map[string]string{"Content-Type": "text/plain", "Cache-Control": "max-age=60", "ETag": `"d1"`})
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/doc.txt"
+
+	doProxy(t, proxy, "GET", target, nil)
+	resp, body := doProxy(t, proxy, "GET", target, map[string]string{"If-Range": `"d1"`})
+	if resp.StatusCode != 200 || body != "document" {
+		t.Fatalf("status = %d body = %q", resp.StatusCode, body)
+	}
+	if got := atomic.LoadInt32(hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2 (If-Range must not be answered from cache)", got)
+	}
+}
+
+func TestResponseCacheByteAccounting(t *testing.T) {
+	c, err := newResponseCache(3, 10, 6)
+	if err != nil {
+		t.Fatalf("newResponseCache: %v", err)
+	}
+	entry := func(n int) *cacheEntry { return &cacheEntry{content: []byte(strings.Repeat("z", n))} }
+	expectStats := func(step string, wantEntries int, wantBytes int64) {
+		t.Helper()
+		if entries, bytes := c.stats(); entries != wantEntries || bytes != wantBytes {
+			t.Fatalf("%s: %d entries / %d bytes, want %d / %d", step, entries, bytes, wantEntries, wantBytes)
+		}
+	}
+
+	c.add("a", entry(4))
+	c.add("b", entry(4))
+	expectStats("two entries", 2, 8)
+
+	c.add("c", entry(4)) // 12 bytes > 10: evict the oldest ("a")
+	expectStats("byte cap", 2, 8)
+	if _, ok := c.get("a"); ok {
+		t.Fatal("oldest entry survived the byte cap")
+	}
+
+	if c.add("big", entry(7)) {
+		t.Fatal("entry above the per-entry cap was stored")
+	}
+	expectStats("per-entry cap", 2, 8)
+
+	c.add("b", entry(2)) // replacement re-accounts the key
+	expectStats("replacement", 2, 6)
+
+	c.add("d", entry(1))
+	c.add("e", entry(1)) // four keys > 3 entries: evict the least recent ("c")
+	expectStats("entry cap", 3, 4)
+	if _, ok := c.get("c"); ok {
+		t.Fatal("least recently used entry survived the entry cap")
+	}
+
+	c.remove("b")
+	expectStats("remove", 2, 2)
+}
+
+func TestConfiguredCacheLimits(t *testing.T) {
+	resetProxyState(t)
+	if maxCacheEntryBytes != 1<<20 || maxCacheBytes != 32<<20 {
+		t.Fatalf("limits = %d per entry / %d total, want 1 MiB / 32 MiB", maxCacheEntryBytes, maxCacheBytes)
+	}
+	if cache.maxEntries != 100 || cache.maxBytes != maxCacheBytes || cache.maxEntryBytes != maxCacheEntryBytes {
+		t.Fatalf("configured cache = %d entries / %d bytes / %d per entry", cache.maxEntries, cache.maxBytes, cache.maxEntryBytes)
 	}
 }

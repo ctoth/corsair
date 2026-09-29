@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,8 +35,9 @@ var (
 	clientTimeout   time.Duration
 	cacheSize       int
 	client          *http.Client
-	cache           *lru.Cache
-	cacheMutex      sync.RWMutex
+	cache           *responseCache
+	// nowFunc is the cache's clock; tests replace it.
+	nowFunc = time.Now
 )
 
 var (
@@ -74,6 +75,8 @@ type cacheEntry struct {
 	statusCode   int
 	etag         string
 	lastModified string
+	// expires is when the entry stops being fresh and must be revalidated.
+	expires time.Time
 }
 
 func init() {
@@ -125,7 +128,7 @@ func configure() {
 	}
 
 	var err error
-	cache, err = lru.New(cacheSize)
+	cache, err = newResponseCache(cacheSize, maxCacheBytes, maxCacheEntryBytes)
 	if err != nil {
 		log.Fatalf("Failed to create cache: %v", err)
 	}
@@ -214,37 +217,60 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Domain not allowed", http.StatusForbidden)
 		return
 	}
-	targetURL := target.String()
-
 	useCache := isCacheableRequest(r)
+	var stale *cacheEntry
 	if useCache {
-		cacheMutex.RLock()
-		if entry, ok := cache.Get(targetURL); ok {
-			cacheMutex.RUnlock()
-			cacheHitCounter.Inc()
-			cachedEntry, ok := entry.(cacheEntry)
-			if !ok {
-				log.Printf("Cache entry type assertion failed for %s", targetURL)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
+		if entry, ok := cache.get(target.String()); ok {
+			if nowFunc().Before(entry.expires) {
+				cacheHitCounter.Inc()
+				serveCachedEntry(w, r, entry)
 				return
 			}
-
-			if matchHeader(r, "If-None-Match", cachedEntry.etag) || matchHeader(r, "If-Modified-Since", cachedEntry.lastModified) {
-				copyResponseHeaders(w.Header(), cachedEntry.headers)
-				w.WriteHeader(http.StatusNotModified)
-				return
-			}
-
-			copyResponseHeaders(w.Header(), cachedEntry.headers)
-			w.WriteHeader(cachedEntry.statusCode)
-			w.Write(cachedEntry.content)
-			return
+			stale = entry
 		}
-		cacheMutex.RUnlock()
 		cacheMissCounter.Inc()
 	}
 
-	forwardRequest(w, r, target, useCache)
+	forwardRequest(w, r, target, useCache, stale)
+}
+
+// serveCachedEntry answers from a fresh or just-revalidated entry, honouring
+// the client's own validators.
+func serveCachedEntry(w http.ResponseWriter, r *http.Request, entry *cacheEntry) {
+	copyResponseHeaders(w.Header(), entry.headers)
+	if clientHasCurrentCopy(r, entry) {
+		w.Header().Del("Content-Length")
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(entry.statusCode)
+	w.Write(entry.content)
+}
+
+// clientHasCurrentCopy evaluates If-None-Match (weak comparison) or, when
+// that is absent, If-Modified-Since against a cached entry.
+func clientHasCurrentCopy(r *http.Request, entry *cacheEntry) bool {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		if entry.etag == "" {
+			return false
+		}
+		for _, tag := range strings.Split(inm, ",") {
+			tag = strings.TrimSpace(tag)
+			if tag == "*" || strings.TrimPrefix(tag, "W/") == strings.TrimPrefix(entry.etag, "W/") {
+				return true
+			}
+		}
+		return false
+	}
+	ims, err := http.ParseTime(r.Header.Get("If-Modified-Since"))
+	if err != nil {
+		return false
+	}
+	lastModified, err := http.ParseTime(entry.lastModified)
+	if err != nil {
+		return false
+	}
+	return !lastModified.After(ims)
 }
 
 const (
@@ -326,7 +352,9 @@ func upstreamErrorReason(err error) error {
 	return err
 }
 
-func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, useCache bool) {
+// forwardRequest relays the request to the origin. When stale is non-nil it
+// is an expired cache entry for this target, revalidated with its validators.
+func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, useCache bool, stale *cacheEntry) {
 	targetURL := target.String()
 	var body io.Reader
 	if r.ContentLength != 0 {
@@ -343,25 +371,23 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 	req.ContentLength = r.ContentLength
 	req.Header = upstreamRequestHeaders(r.Header)
 
-	if useCache {
-		cacheMutex.RLock()
-		if entry, ok := cache.Get(targetURL); ok {
-			cachedEntry, ok := entry.(cacheEntry)
-			if !ok {
-				cacheMutex.RUnlock()
-				log.Printf("Cache entry type assertion failed for %s", targetURL)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-				return
+	if stale != nil {
+		if stale.etag == "" && stale.lastModified == "" {
+			// Nothing to revalidate with: drop it and fetch afresh.
+			cache.remove(targetURL)
+			stale = nil
+		} else {
+			// Revalidate with the stored validators, not the client's; the
+			// client's own validators are applied to the refreshed entry.
+			req.Header.Del("If-None-Match")
+			req.Header.Del("If-Modified-Since")
+			if stale.etag != "" {
+				req.Header.Set("If-None-Match", stale.etag)
 			}
-
-			if cachedEntry.etag != "" {
-				req.Header.Set("If-None-Match", cachedEntry.etag)
-			}
-			if cachedEntry.lastModified != "" {
-				req.Header.Set("If-Modified-Since", cachedEntry.lastModified)
+			if stale.lastModified != "" {
+				req.Header.Set("If-Modified-Since", stale.lastModified)
 			}
 		}
-		cacheMutex.RUnlock()
 	}
 
 	resp, err := client.Do(req)
@@ -383,17 +409,57 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 	defer resp.Body.Close()
 
 	responseHeaders := upstreamResponseHeaders(resp)
-	copyResponseHeaders(w.Header(), responseHeaders)
-	w.WriteHeader(resp.StatusCode)
 
-	var captured *bytes.Buffer
-	if useCache && isCacheableResponse(resp) && !isStreamingResponse(resp) {
-		captured = new(bytes.Buffer)
-	} else {
-		log.Printf("Streaming response for %s", redactURL(target))
+	if stale != nil {
+		if resp.StatusCode == http.StatusNotModified {
+			refreshed := stale.refreshed(responseHeaders, nowFunc())
+			if nowFunc().Before(refreshed.expires) {
+				cache.add(targetURL, refreshed)
+			} else {
+				cache.remove(targetURL)
+			}
+			serveCachedEntry(w, r, refreshed)
+			return
+		}
+		cache.remove(targetURL)
 	}
 
-	if err := streamBody(w, resp.Body, captured); err != nil {
+	if useCache {
+		if lifetime := cacheLifetime(resp, target, nowFunc()); lifetime > 0 {
+			// cacheLifetime admits only known lengths within the entry cap,
+			// so buffering is bounded. The entry is stored before the client
+			// sees the last byte, so an immediate repeat request hits it.
+			content := make([]byte, resp.ContentLength)
+			if _, err := io.ReadFull(resp.Body, content); err != nil {
+				if r.Context().Err() != nil {
+					log.Printf("Client disconnected before %s responded", redactURL(target))
+					return
+				}
+				log.Printf("Error reading response for %s: %v", redactURL(target), err)
+				http.Error(w, "Upstream response was truncated", http.StatusBadGateway)
+				return
+			}
+			entry := &cacheEntry{
+				content:      content,
+				headers:      responseHeaders,
+				statusCode:   resp.StatusCode,
+				etag:         resp.Header.Get("ETag"),
+				lastModified: resp.Header.Get("Last-Modified"),
+				expires:      nowFunc().Add(lifetime),
+			}
+			cache.add(targetURL, entry)
+			copyResponseHeaders(w.Header(), responseHeaders)
+			w.WriteHeader(resp.StatusCode)
+			w.Write(content)
+			return
+		}
+	}
+
+	copyResponseHeaders(w.Header(), responseHeaders)
+	w.WriteHeader(resp.StatusCode)
+	log.Printf("Streaming response for %s", redactURL(target))
+
+	if err := streamBody(w, resp.Body); err != nil {
 		var writeErr *clientWriteError
 		if r.Context().Err() != nil || errors.As(err, &writeErr) {
 			log.Printf("Client disconnected while streaming %s", redactURL(target))
@@ -404,18 +470,6 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 		// a clean end or an error message appended to the body.
 		log.Printf("Error streaming response for %s: %v", redactURL(target), err)
 		panic(http.ErrAbortHandler)
-	}
-
-	if captured != nil {
-		cacheMutex.Lock()
-		cache.Add(targetURL, cacheEntry{
-			content:      captured.Bytes(),
-			headers:      responseHeaders,
-			statusCode:   resp.StatusCode,
-			etag:         resp.Header.Get("ETag"),
-			lastModified: resp.Header.Get("Last-Modified"),
-		})
-		cacheMutex.Unlock()
 	}
 }
 
@@ -431,8 +485,7 @@ func (e *clientWriteError) Unwrap() error { return e.err }
 
 // streamBody copies src to w through a bounded buffer, flushing after every
 // chunk so live and progressively loaded media reach the client promptly.
-// When capture is non-nil the bytes are also accumulated there.
-func streamBody(w http.ResponseWriter, src io.Reader, capture *bytes.Buffer) error {
+func streamBody(w http.ResponseWriter, src io.Reader) error {
 	controller := http.NewResponseController(w)
 	buf := make([]byte, streamBuffer)
 	for {
@@ -444,9 +497,6 @@ func streamBody(w http.ResponseWriter, src io.Reader, capture *bytes.Buffer) err
 			if err := controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 				return &clientWriteError{err}
 			}
-			if capture != nil {
-				capture.Write(buf[:n])
-			}
 		}
 		if readErr == io.EOF {
 			return nil
@@ -457,42 +507,230 @@ func streamBody(w http.ResponseWriter, src io.Reader, capture *bytes.Buffer) err
 	}
 }
 
+// isCacheableRequest reports whether a request may be answered from, or
+// populate, the shared cache. Credentialed and partial requests never are:
+// a cached whole object must never answer a range request.
 func isCacheableRequest(r *http.Request) bool {
 	if r.Method != "GET" {
 		return false
 	}
-	if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Range") != "" {
-		return false
-	}
-	return true
-}
-
-func isCacheableResponse(resp *http.Response) bool {
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Vary") != "" {
-		return false
-	}
-	cacheControl := strings.ToLower(resp.Header.Get("Cache-Control"))
-	for _, directive := range strings.Split(cacheControl, ",") {
-		switch strings.TrimSpace(directive) {
-		case "private", "no-store", "no-cache":
+	for _, name := range []string{"Authorization", "Cookie", "Range", "If-Range"} {
+		if r.Header.Get(name) != "" {
 			return false
 		}
 	}
 	return true
 }
 
-func isStreamingResponse(resp *http.Response) bool {
-	if resp.ContentLength < 0 {
+// cacheLifetime returns how long an origin response may be served from the
+// cache, or zero when it must not be stored at all.
+func cacheLifetime(resp *http.Response, target *url.URL, now time.Time) time.Duration {
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Vary") != "" {
+		return 0
+	}
+	directives := cacheControlDirectives(resp.Header)
+	for _, name := range []string{"private", "no-store", "no-cache"} {
+		if _, ok := directives[name]; ok {
+			return 0
+		}
+	}
+	// Media is streamed and seeked by range; manifests change underneath
+	// their URL. Neither belongs in the cache.
+	if isMediaOrManifest(resp.Header.Get("Content-Type"), target) {
+		return 0
+	}
+	// Unknown or oversized bodies are streamed without buffering.
+	if resp.ContentLength < 0 || resp.ContentLength > maxCacheEntryBytes {
+		return 0
+	}
+	return freshnessLifetime(resp.Header, now)
+}
+
+// manifestTypes are playlist and manifest MIME types.
+var manifestTypes = map[string]bool{
+	"application/vnd.apple.mpegurl": true,
+	"application/x-mpegurl":         true,
+	"audio/mpegurl":                 true,
+	"audio/x-mpegurl":               true,
+	"application/dash+xml":          true,
+	"application/vnd.ms-sstr+xml":   true,
+}
+
+// manifestExtensions identify playlists served with a generic MIME type.
+var manifestExtensions = []string{".m3u8", ".m3u", ".mpd"}
+
+func isMediaOrManifest(contentType string, target *url.URL) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(contentType))
+	}
+	if strings.HasPrefix(mediaType, "audio/") || strings.HasPrefix(mediaType, "video/") || manifestTypes[mediaType] {
 		return true
 	}
-	if strings.HasPrefix(resp.Header.Get("Content-Type"), "video/") ||
-		strings.HasPrefix(resp.Header.Get("Content-Type"), "audio/") {
-		return true
+	p := strings.ToLower(target.Path)
+	for _, ext := range manifestExtensions {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
 	}
 	return false
+}
+
+// cacheControlDirectives parses Cache-Control into lower-case directive
+// names mapped to their (unquoted) arguments.
+func cacheControlDirectives(h http.Header) map[string]string {
+	directives := make(map[string]string)
+	for _, value := range h.Values("Cache-Control") {
+		for _, part := range strings.Split(value, ",") {
+			name, arg, _ := strings.Cut(strings.TrimSpace(part), "=")
+			if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+				directives[name] = strings.Trim(strings.TrimSpace(arg), `"`)
+			}
+		}
+	}
+	return directives
+}
+
+// freshnessLifetime computes a response's remaining freshness from
+// s-maxage, max-age or Expires (relative to Date), less its Age. Responses
+// without explicit freshness get zero: the proxy never guesses.
+func freshnessLifetime(h http.Header, now time.Time) time.Duration {
+	directives := cacheControlDirectives(h)
+	var lifetime time.Duration
+	if seconds, ok := directiveSeconds(directives, "s-maxage"); ok {
+		lifetime = seconds
+	} else if seconds, ok := directiveSeconds(directives, "max-age"); ok {
+		lifetime = seconds
+	} else if expires := h.Get("Expires"); expires != "" {
+		expiresAt, err := http.ParseTime(expires)
+		if err != nil {
+			return 0 // invalid Expires means already expired
+		}
+		date, err := http.ParseTime(h.Get("Date"))
+		if err != nil {
+			date = now
+		}
+		lifetime = expiresAt.Sub(date)
+	} else {
+		return 0
+	}
+	if age, err := strconv.Atoi(strings.TrimSpace(h.Get("Age"))); err == nil && age > 0 {
+		lifetime -= time.Duration(age) * time.Second
+	}
+	if lifetime < 0 {
+		return 0
+	}
+	return lifetime
+}
+
+func directiveSeconds(directives map[string]string, name string) (time.Duration, bool) {
+	arg, ok := directives[name]
+	if !ok {
+		return 0, false
+	}
+	seconds, err := strconv.ParseInt(arg, 10, 64)
+	if err != nil || seconds < 0 {
+		return 0, true
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+// refreshed merges the headers of a 304 revalidation into a copy of the
+// entry (RFC 9111 section 4.3.4) and recomputes its freshness. The stored
+// body and its length are kept.
+func (e *cacheEntry) refreshed(notModified http.Header, now time.Time) *cacheEntry {
+	headers := e.headers.Clone()
+	for name, values := range notModified {
+		if strings.EqualFold(name, "Content-Length") {
+			continue
+		}
+		headers[name] = append([]string(nil), values...)
+	}
+	updated := *e
+	updated.headers = headers
+	if etag := headers.Get("ETag"); etag != "" {
+		updated.etag = etag
+	}
+	if lastModified := headers.Get("Last-Modified"); lastModified != "" {
+		updated.lastModified = lastModified
+	}
+	updated.expires = now.Add(freshnessLifetime(headers, now))
+	return &updated
+}
+
+// Cache limits. The entry count is configurable with -cache-size.
+const (
+	maxCacheEntryBytes = 1 << 20  // largest body stored
+	maxCacheBytes      = 32 << 20 // total body bytes stored
+)
+
+// responseCache is an LRU of whole 200 responses bounded by entry count,
+// total body bytes and per-entry body bytes. It is safe for concurrent use.
+type responseCache struct {
+	mu            sync.Mutex
+	entries       *lru.Cache
+	bytes         int64
+	maxEntries    int
+	maxBytes      int64
+	maxEntryBytes int64
+}
+
+func newResponseCache(maxEntries int, maxBytes, maxEntryBytes int64) (*responseCache, error) {
+	c := &responseCache{maxEntries: maxEntries, maxBytes: maxBytes, maxEntryBytes: maxEntryBytes}
+	entries, err := lru.NewWithEvict(maxEntries, func(_, value interface{}) {
+		// Called synchronously from Add/Remove/RemoveOldest, with c.mu held.
+		c.bytes -= int64(len(value.(*cacheEntry).content))
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.entries = entries
+	return c, nil
+}
+
+func (c *responseCache) get(key string) (*cacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, ok := c.entries.Get(key)
+	if !ok {
+		return nil, false
+	}
+	return value.(*cacheEntry), true
+}
+
+// add stores an entry, evicting least-recently-used entries until the byte
+// budget holds. It refuses entries above the per-entry cap.
+func (c *responseCache) add(key string, entry *cacheEntry) bool {
+	size := int64(len(entry.content))
+	if size > c.maxEntryBytes || size > c.maxBytes {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries.Remove(key) // re-account a replaced entry
+	for c.bytes+size > c.maxBytes {
+		if _, _, ok := c.entries.RemoveOldest(); !ok {
+			break
+		}
+	}
+	c.entries.Add(key, entry)
+	c.bytes += size
+	return true
+}
+
+func (c *responseCache) remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries.Remove(key)
+}
+
+func (c *responseCache) stats() (entries int, bytes int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.entries.Len(), c.bytes
 }
 
 // hopByHopHeaders are connection-scoped (RFC 9110 section 7.6.1) and are
@@ -572,14 +810,6 @@ func copyResponseHeaders(dst, src http.Header) {
 		}
 		dst[name] = append([]string(nil), values...)
 	}
-}
-
-func matchHeader(r *http.Request, headerName, headerValue string) bool {
-	h := r.Header.Get(headerName)
-	if h == "" {
-		return false
-	}
-	return h == headerValue
 }
 
 func getEnv(key, fallback string) string {
