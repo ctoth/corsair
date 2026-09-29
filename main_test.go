@@ -1070,6 +1070,106 @@ func TestCachedEntryExpiresAndRevalidatesWith304Merge(t *testing.T) {
 	expect("stale again", 2*time.Second, nil, 200, `{"a":"b"}`, "2", 3)
 }
 
+func TestUncacheable304HeadersEvictTheEntry(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"set-cookie", map[string]string{"Set-Cookie": "session=abc"}},
+		{"vary", map[string]string{"Vary": "Cookie"}},
+		{"private", map[string]string{"Cache-Control": "private, max-age=60"}},
+		{"no-store", map[string]string{"Cache-Control": "no-store, max-age=60"}},
+		{"no-cache", map[string]string{"Cache-Control": "no-cache, max-age=60"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetProxyState(t)
+			clock := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+			setClock(t, &clock)
+
+			var hits int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Cache-Control", "max-age=60")
+				w.Header().Set("ETag", `"v1"`)
+				if r.Header.Get("If-None-Match") == `"v1"` {
+					for k, v := range tt.headers {
+						w.Header().Set(k, v)
+					}
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", "9")
+				io.WriteString(w, `{"a":"b"}`)
+			}))
+			defer origin.Close()
+			proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+			defer proxy.Close()
+			target := origin.URL + "/data.json"
+
+			doProxy(t, proxy, "GET", target, nil)
+			clock = clock.Add(61 * time.Second)
+			doProxy(t, proxy, "GET", target, nil) // revalidated by a 304
+			if entries, _ := cache.stats(); entries != 0 {
+				t.Fatalf("cache holds %d entries after an uncacheable 304, want none", entries)
+			}
+
+			resp, body := doProxy(t, proxy, "GET", target, nil)
+			if body != `{"a":"b"}` {
+				t.Fatalf("body = %q", body)
+			}
+			if got := resp.Header.Get("Set-Cookie"); got != "" {
+				t.Fatalf("another client received Set-Cookie %q from the cache", got)
+			}
+			if got := atomic.LoadInt32(&hits); got != 3 {
+				t.Fatalf("origin hits = %d, want 3 (entry must not be served after the 304)", got)
+			}
+		})
+	}
+}
+
+func Test304WithoutAgeRestartsFreshness(t *testing.T) {
+	resetProxyState(t)
+	clock := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	setClock(t, &clock)
+
+	var hits int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("ETag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Age", "55") // as relayed by a CDN
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "9")
+		io.WriteString(w, `{"a":"b"}`)
+	}))
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/data.json"
+
+	doProxy(t, proxy, "GET", target, nil)
+	clock = clock.Add(6 * time.Second)
+	doProxy(t, proxy, "GET", target, nil) // revalidated by a 304 without Age
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2 after revalidation", got)
+	}
+
+	clock = clock.Add(30 * time.Second)
+	resp, _ := doProxy(t, proxy, "GET", target, nil)
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("origin hits = %d, want 2 (304 restarts the 60s lifetime)", got)
+	}
+	if got := resp.Header.Get("Age"); got == "55" {
+		t.Fatalf("cached response still carries the pre-revalidation Age %q", got)
+	}
+}
+
 func TestExpiresHeaderBoundsFreshness(t *testing.T) {
 	resetProxyState(t)
 	clock := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)

@@ -413,7 +413,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 	if stale != nil {
 		if resp.StatusCode == http.StatusNotModified {
 			refreshed := stale.refreshed(responseHeaders, nowFunc())
-			if nowFunc().Before(refreshed.expires) {
+			if sharedCacheAllowed(refreshed.headers) && nowFunc().Before(refreshed.expires) {
 				cache.add(targetURL, refreshed)
 			} else {
 				cache.remove(targetURL)
@@ -525,17 +525,8 @@ func isCacheableRequest(r *http.Request) bool {
 // cacheLifetime returns how long an origin response may be served from the
 // cache, or zero when it must not be stored at all.
 func cacheLifetime(resp *http.Response, target *url.URL, now time.Time) time.Duration {
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK || !sharedCacheAllowed(resp.Header) {
 		return 0
-	}
-	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Vary") != "" {
-		return 0
-	}
-	directives := cacheControlDirectives(resp.Header)
-	for _, name := range []string{"private", "no-store", "no-cache"} {
-		if _, ok := directives[name]; ok {
-			return 0
-		}
 	}
 	// Media is streamed and seeked by range; manifests change underneath
 	// their URL. Neither belongs in the cache.
@@ -547,6 +538,22 @@ func cacheLifetime(resp *http.Response, target *url.URL, now time.Time) time.Dur
 		return 0
 	}
 	return freshnessLifetime(resp.Header, now)
+}
+
+// sharedCacheAllowed reports whether headers permit serving the response to
+// other clients: nothing per-user, nothing varying, nothing the origin has
+// forbidden a shared cache to keep.
+func sharedCacheAllowed(h http.Header) bool {
+	if h.Get("Set-Cookie") != "" || h.Get("Vary") != "" {
+		return false
+	}
+	directives := cacheControlDirectives(h)
+	for _, name := range []string{"private", "no-store", "no-cache"} {
+		if _, ok := directives[name]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 // manifestTypes are playlist and manifest MIME types.
@@ -640,9 +647,11 @@ func directiveSeconds(directives map[string]string, name string) (time.Duration,
 
 // refreshed merges the headers of a 304 revalidation into a copy of the
 // entry (RFC 9111 section 4.3.4) and recomputes its freshness. The stored
-// body and its length are kept.
+// body and its length are kept. The stored Age described the old response;
+// only an Age sent with the 304 applies to the refreshed one.
 func (e *cacheEntry) refreshed(notModified http.Header, now time.Time) *cacheEntry {
 	headers := e.headers.Clone()
+	headers.Del("Age")
 	for name, values := range notModified {
 		if strings.EqualFold(name, "Content-Length") {
 			continue
