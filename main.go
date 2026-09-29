@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -116,7 +117,9 @@ func configure() {
 		allowAllDomains = true
 	} else {
 		for _, domain := range strings.Split(domains, ",") {
-			allowedDomains[domain] = true
+			if domain = strings.ToLower(strings.TrimSpace(domain)); domain != "" {
+				allowedDomains[domain] = true
+			}
 		}
 	}
 
@@ -128,11 +131,30 @@ func configure() {
 
 	clientTimeout = time.Duration(timeout) * time.Second
 	client = &http.Client{
-		Timeout: clientTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil // This will allow the client to follow redirects.
-		},
+		Timeout:       clientTimeout,
+		CheckRedirect: checkRedirect,
 	}
+}
+
+// maxRedirects is the number of redirects the proxy follows for one request.
+const maxRedirects = 10
+
+var (
+	errTooManyRedirects   = fmt.Errorf("stopped after %d redirects", maxRedirects)
+	errRedirectNotAllowed = errors.New("redirect target is not allowed")
+)
+
+// checkRedirect caps redirect chains and re-applies the target rules (scheme,
+// host and domain allowlist) to every hop, so a redirect cannot reach a target
+// the proxy would refuse if it were requested directly.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxRedirects {
+		return errTooManyRedirects
+	}
+	if validateTarget(req.URL) != nil || !isDomainAllowed(req.URL) {
+		return errRedirectNotAllowed
+	}
+	return nil
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -157,16 +179,17 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURL, err := parseTargetURL(r.URL.Query())
+	target, err := parseTargetURL(r.URL.Query())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid target URL: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if !isDomainAllowed(targetURL) {
+	if !isDomainAllowed(target) {
 		http.Error(w, "Domain not allowed", http.StatusForbidden)
 		return
 	}
+	targetURL := target.String()
 
 	useCache := isCacheableRequest(r)
 	if useCache {
@@ -196,48 +219,94 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		cacheMissCounter.Inc()
 	}
 
-	forwardRequest(w, r, targetURL, useCache)
+	forwardRequest(w, r, target, useCache)
 }
 
+const (
+	corsAllowMethods  = "GET, HEAD, POST, OPTIONS"
+	corsAllowHeaders  = "Content-Type, Range, If-Range, If-None-Match, If-Modified-Since"
+	corsExposeHeaders = "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Type"
+)
+
+// setCorsHeaders installs the proxy's CORS policy. It is applied to every
+// response, including preflights, which are answered without contacting the
+// origin.
 func setCorsHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
+	w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+	w.Header().Set("Access-Control-Expose-Headers", corsExposeHeaders)
 }
 
-func parseTargetURL(query url.Values) (string, error) {
-	targetURL := query.Get("url")
-	if targetURL == "" {
-		return "", fmt.Errorf("query parameter 'url' is missing")
+// parseTargetURL extracts the target from the "url" query parameter. Errors
+// never quote the raw value, which may carry signed-URL secrets.
+func parseTargetURL(query url.Values) (*url.URL, error) {
+	raw := query.Get("url")
+	if raw == "" {
+		return nil, errors.New("query parameter 'url' is missing")
 	}
 
-	parsedURL, err := url.Parse(targetURL)
+	target, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid target URL: %w", err)
+		return nil, errors.New("target is not a parseable URL")
 	}
-
-	return parsedURL.String(), nil
+	if err := validateTarget(target); err != nil {
+		return nil, err
+	}
+	return target, nil
 }
 
-func isDomainAllowed(targetURL string) bool {
+// validateTarget accepts only absolute HTTP(S) URLs with a host and without
+// embedded credentials.
+func validateTarget(target *url.URL) error {
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return errors.New("target must be an absolute http or https URL")
+	}
+	if target.Hostname() == "" {
+		return errors.New("target URL has no host")
+	}
+	if target.User != nil {
+		return errors.New("target URL must not contain credentials")
+	}
+	return nil
+}
+
+func isDomainAllowed(target *url.URL) bool {
 	if allowAllDomains {
 		return true
 	}
-
-	parsedURL, err := url.Parse(targetURL)
-	if err != nil {
-		log.Printf("Error parsing URL: %v", err)
-		return false
-	}
-
-	_, ok := allowedDomains[parsedURL.Hostname()]
-	return ok
+	return allowedDomains[strings.ToLower(target.Hostname())]
 }
 
-func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, useCache bool) {
+// redactURL renders a URL for logs and error messages without its query
+// string, fragment or credentials.
+func redactURL(u *url.URL) string {
+	redacted := *u
+	redacted.User = nil
+	redacted.Fragment = ""
+	redacted.RawFragment = ""
+	if redacted.RawQuery != "" {
+		redacted.RawQuery = "REDACTED"
+	}
+	return redacted.String()
+}
+
+// upstreamErrorReason describes a client.Do failure without the request URL
+// that *url.Error would otherwise embed.
+func upstreamErrorReason(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
+}
+
+func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, useCache bool) {
+	targetURL := target.String()
 	req, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error creating new request: %v", err), http.StatusInternalServerError)
+		log.Printf("Error creating request for %s: %v", redactURL(target), err)
+		http.Error(w, "Error creating upstream request", http.StatusInternalServerError)
 		return
 	}
 
@@ -266,7 +335,13 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, us
 
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error forwarding request: %v", err), http.StatusInternalServerError)
+		reason := upstreamErrorReason(err)
+		log.Printf("Upstream request for %s failed: %v", redactURL(target), reason)
+		if errors.Is(reason, errRedirectNotAllowed) {
+			http.Error(w, "Redirect target not allowed", http.StatusForbidden)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Upstream request failed: %v", reason), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -294,10 +369,10 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, us
 
 		w.Write(bodyBytes)
 	} else {
-		log.Printf("Streaming response for %s", targetURL)
+		log.Printf("Streaming response for %s", redactURL(target))
 		_, copyErr := io.Copy(w, resp.Body)
 		if copyErr != nil {
-			log.Printf("Error streaming response for %s: %v", targetURL, copyErr)
+			log.Printf("Error streaming response for %s: %v", redactURL(target), copyErr)
 		}
 	}
 }
@@ -353,8 +428,7 @@ func cloneHeaders(headers http.Header) http.Header {
 
 func copyHeaders(dst, src http.Header) {
 	protectedHeaders := []string{"Host", "Content-Length", "Connection"}
-	// CORS headers that we want to ignore from upstream
-	corsHeaders := []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers"}
+	// Upstream CORS headers (Access-Control-*) never override the proxy's policy.
 
 	isProtectedHeader := func(header string) bool {
 		for _, h := range protectedHeaders {
@@ -366,12 +440,7 @@ func copyHeaders(dst, src http.Header) {
 	}
 
 	isCorsHeader := func(header string) bool {
-		for _, h := range corsHeaders {
-			if strings.EqualFold(h, header) {
-				return true
-			}
-		}
-		return false
+		return strings.HasPrefix(http.CanonicalHeaderKey(header), "Access-Control-")
 	}
 
 	for k, vv := range src {
