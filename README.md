@@ -7,14 +7,14 @@ Corsair is a high-performance HTTP proxy server written in Go that enables cross
 ## Features
 
 - **CORS Handling**: Automatically adds appropriate CORS headers to enable cross-origin requests
-- **Smart Caching**: Built-in LRU cache with ETag and Last-Modified support
+- **Smart Caching**: Built-in LRU cache that honours `max-age`/`Expires`, revalidates stale entries with ETag and Last-Modified, and is bounded to 1 MiB per entry and 32 MiB in total. Media, playlists/manifests, range requests and credentialed requests are never cached
 - **Performance Monitoring**: Prometheus metrics for request tracking and performance analysis
-- **Streaming Support**: Handles streaming responses for video/audio content
+- **Streaming Support**: Streams bodies with per-chunk flushing, passes Range/If-Range requests and 206/416 responses through unchanged, and cancels the upstream fetch when the client disconnects
 - **Flexible Configuration**: Configurable via both environment variables and command-line flags
 - **Health Checks**: Built-in health check endpoint
 - **Domain Filtering**: Optional whitelist of allowed domains
-- **Redirect Handling**: Properly follows HTTP redirects
-- **Request Forwarding**: Preserves headers and request methods
+- **Redirect Handling**: Follows up to 10 redirects, re-checking the domain allowlist on every hop
+- **Request Forwarding**: Preserves end-to-end headers and request methods; hop-by-hop headers are dropped
 
 ## Getting Started
 
@@ -74,10 +74,11 @@ http://localhost:8080/?url=https://api.example.com/data
 ### API Documentation
 
 #### Main Proxy Endpoint (/)
-- Method: GET, POST, OPTIONS
+- Method: GET, HEAD, POST, OPTIONS
 - Query Parameters:
-  - `url`: (Required) The target URL to proxy
+  - `url`: (Required) The target URL to proxy: an absolute `http` or `https` URL with a host and no embedded credentials
 - Example: `curl "http://localhost:8080/?url=https://api.example.com/data"`
+- CORS: `Access-Control-Allow-Origin: *`. Allowed request headers: `Content-Type, Range, If-Range, If-None-Match, If-Modified-Since`. Exposed response headers: `Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Type`. Preflight `OPTIONS` requests are answered without contacting the target.
 
 #### Health Check (/health)
 - Method: GET
@@ -100,8 +101,8 @@ Corsair can be configured through environment variables or command-line flags. F
 | `CORSAIR_PORT` | Server port | 8080 | `8081` |
 | `CORSAIR_INTERFACE` | Network interface | localhost | `0.0.0.0` |
 | `CORSAIR_DOMAINS` | Allowed domains (comma-separated) | * | `api1.com,api2.com` |
-| `CORSAIR_TIMEOUT` | Client timeout (seconds) | 15 | `30` |
-| `CORSAIR_CACHE_SIZE` | LRU cache size | 100 | `1000` |
+| `CORSAIR_TIMEOUT` | Seconds to wait for upstream response headers (0 = no limit). Streamed bodies have no total deadline | 0 | `30` |
+| `CORSAIR_CACHE_SIZE` | Maximum cache entries | 100 | `1000` |
 
 #### Command-Line Flags
 
@@ -110,8 +111,8 @@ Corsair can be configured through environment variables or command-line flags. F
 | `--port` | Server port | 8080 | `--port 8081` |
 | `--interface` | Network interface | localhost | `--interface 0.0.0.0` |
 | `--domains` | Allowed domains | * | `--domains api1.com,api2.com` |
-| `--timeout` | Client timeout | 15 | `--timeout 30` |
-| `--cache-size` | LRU cache size | 100 | `--cache-size 1000` |
+| `--timeout` | Upstream response-header timeout (seconds) | 0 | `--timeout 30` |
+| `--cache-size` | Maximum cache entries | 100 | `--cache-size 1000` |
 | `--version` | Show version info | false | `--version` |
 
 ### Monitoring
