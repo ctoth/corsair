@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -528,5 +529,416 @@ func TestQueryStringsAreRedactedFromErrorsAndLogs(t *testing.T) {
 
 	if strings.Contains(logs.String(), "topsecret") {
 		t.Fatalf("logs leak query: %q", logs.String())
+	}
+}
+
+// seekableMedia is a 100-byte resource served with http.ServeContent, which
+// implements Range, suffix ranges, 416, HEAD and If-Range like a real origin.
+const seekableMedia = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + "!@#$%^&*()-_=+[]{};:,.<>/?|~0123456789"
+
+type seenRequest struct {
+	method         string
+	rangeHeader    string
+	acceptEncoding string
+}
+
+func newSeekableOrigin(t *testing.T, contentType string, cacheControl string) (*httptest.Server, func() []seenRequest) {
+	t.Helper()
+	if len(seekableMedia) != 100 {
+		t.Fatalf("fixture length = %d", len(seekableMedia))
+	}
+	var mu sync.Mutex
+	var seen []seenRequest
+	modTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Direct") == "" { // record only proxied requests
+			mu.Lock()
+			seen = append(seen, seenRequest{r.Method, r.Header.Get("Range"), r.Header.Get("Accept-Encoding")})
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("ETag", `"media-v1"`)
+		if cacheControl != "" {
+			w.Header().Set("Cache-Control", cacheControl)
+		}
+		http.ServeContent(w, r, "media", modTime, strings.NewReader(seekableMedia))
+	}))
+	return server, func() []seenRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]seenRequest(nil), seen...)
+	}
+}
+
+func doProxy(t *testing.T, proxy *httptest.Server, method, target string, headers map[string]string) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequest(method, proxiedURL(proxy.URL, target), nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %v failed: %v", method, headers, err)
+	}
+	return resp, readResponseBody(t, resp)
+}
+
+func TestRangeRequestsPassThroughExactly(t *testing.T) {
+	resetProxyState(t)
+
+	origin, seen := newSeekableOrigin(t, "audio/mp4", "")
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/buzz1.m4a"
+
+	type want struct {
+		status       int
+		contentRange string
+		length       string
+		body         string
+	}
+	cases := []struct {
+		name    string
+		method  string
+		headers map[string]string
+		want    want
+	}{
+		{"first 64 bytes", "GET", map[string]string{"Range": "bytes=0-63"},
+			want{206, "bytes 0-63/100", "64", seekableMedia[:64]}},
+		{"suffix range", "GET", map[string]string{"Range": "bytes=-10"},
+			want{206, "bytes 90-99/100", "10", seekableMedia[90:]}},
+		{"unsatisfiable", "GET", map[string]string{"Range": "bytes=100-"},
+			want{416, "bytes */100", "", ""}},
+		{"HEAD", "HEAD", nil,
+			want{200, "", "100", ""}},
+		{"If-Range matches", "GET", map[string]string{"Range": "bytes=10-19", "If-Range": `"media-v1"`},
+			want{206, "bytes 10-19/100", "10", seekableMedia[10:20]}},
+		{"If-Range stale", "GET", map[string]string{"Range": "bytes=10-19", "If-Range": `"media-v0"`},
+			want{200, "", "100", seekableMedia}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doProxy(t, proxy, tc.method, target, tc.headers)
+			if resp.StatusCode != tc.want.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want.status)
+			}
+			assertHeader(t, resp.Header, "Content-Range", tc.want.contentRange)
+			if tc.want.length != "" {
+				assertHeader(t, resp.Header, "Content-Length", tc.want.length)
+			}
+			wantBody := tc.want.body
+			if tc.want.status == http.StatusRequestedRangeNotSatisfiable {
+				// The 416 body is the origin's; compare it with a direct fetch.
+				directReq, _ := http.NewRequest(tc.method, target, nil)
+				for k, v := range tc.headers {
+					directReq.Header.Set(k, v)
+				}
+				directReq.Header.Set("X-Test-Direct", "1")
+				directResp, err := origin.Client().Do(directReq)
+				if err != nil {
+					t.Fatalf("direct request failed: %v", err)
+				}
+				wantBody = readResponseBody(t, directResp)
+			}
+			if body != wantBody {
+				t.Fatalf("body = %q, want %q", body, wantBody)
+			}
+			if tc.want.status != 416 {
+				assertHeader(t, resp.Header, "Accept-Ranges", "bytes")
+				assertHeader(t, resp.Header, "ETag", `"media-v1"`)
+			}
+			assertCorsPolicy(t, resp.Header)
+		})
+	}
+
+	for _, req := range seen() {
+		if req.rangeHeader != "" && req.acceptEncoding != "identity" {
+			t.Fatalf("range request %+v reached origin with Accept-Encoding %q, want identity", req, req.acceptEncoding)
+		}
+	}
+	if got := seen(); len(got) != len(cases) || got[3].method != "HEAD" {
+		t.Fatalf("origin saw %+v", got)
+	}
+}
+
+func TestFullAndPartialResponsesDoNotPoisonEachOther(t *testing.T) {
+	resetProxyState(t)
+
+	// Cacheable by every rule except the range: a full 200 may be cached, but
+	// it must never answer a later range request, and vice versa.
+	origin, seen := newSeekableOrigin(t, "application/octet-stream", "max-age=60")
+	defer origin.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	target := origin.URL + "/blob.bin"
+
+	resp, body := doProxy(t, proxy, "GET", target, nil)
+	if resp.StatusCode != 200 || body != seekableMedia {
+		t.Fatalf("full: status = %d body = %q", resp.StatusCode, body)
+	}
+	resp, body = doProxy(t, proxy, "GET", target, map[string]string{"Range": "bytes=0-9"})
+	if resp.StatusCode != 206 || body != seekableMedia[:10] {
+		t.Fatalf("range after full: status = %d body = %q", resp.StatusCode, body)
+	}
+	assertHeader(t, resp.Header, "Content-Range", "bytes 0-9/100")
+	resp, body = doProxy(t, proxy, "GET", target, nil)
+	if resp.StatusCode != 200 || body != seekableMedia {
+		t.Fatalf("full after range: status = %d body = %q", resp.StatusCode, body)
+	}
+	assertHeader(t, resp.Header, "Content-Range", "")
+
+	if got := seen(); len(got) != 2 || got[1].rangeHeader != "bytes=0-9" {
+		t.Fatalf("origin saw %+v, want the full fetch and the range fetch only", got)
+	}
+}
+
+func TestClientDisconnectCancelsUpstreamRequest(t *testing.T) {
+	resetProxyState(t)
+
+	upstreamCancelled := make(chan struct{})
+	testDone := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "first")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(upstreamCancelled)
+		case <-testDone:
+		}
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	defer close(testDone) // runs before the servers' Close, which wait for handlers
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", proxiedURL(proxy.URL, upstream.URL+"/live.mp3"), nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	first := make([]byte, len("first"))
+	if _, err := io.ReadFull(resp.Body, first); err != nil || string(first) != "first" {
+		t.Fatalf("first chunk = %q, err = %v", first, err)
+	}
+
+	cancel()
+
+	select {
+	case <-upstreamCancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream request was not cancelled after the client disconnected")
+	}
+}
+
+func TestFlushingSourceReachesClientBeforeSourceCloses(t *testing.T) {
+	resetProxyState(t)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "first-chunk")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, "-rest")
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+	defer releaseUpstream() // runs before the servers' Close, which wait for handlers
+
+	type result struct {
+		resp *http.Response
+		data string
+		err  error
+	}
+	firstChunk := make(chan result, 1)
+	go func() {
+		resp, err := proxy.Client().Get(proxiedURL(proxy.URL, upstream.URL+"/live.mp3"))
+		if err != nil {
+			firstChunk <- result{err: err}
+			return
+		}
+		buf := make([]byte, len("first-chunk"))
+		_, err = io.ReadFull(resp.Body, buf)
+		firstChunk <- result{resp: resp, data: string(buf), err: err}
+	}()
+
+	var got result
+	select {
+	case got = <-firstChunk:
+	case <-time.After(2 * time.Second):
+		releaseUpstream()
+		t.Fatal("first chunk did not arrive while the source was still open")
+	}
+	if got.err != nil || got.data != "first-chunk" {
+		t.Fatalf("first chunk = %q, err = %v", got.data, got.err)
+	}
+
+	releaseUpstream()
+	if rest := readResponseBody(t, got.resp); rest != "-rest" {
+		t.Fatalf("remaining body = %q", rest)
+	}
+}
+
+func TestLiveStreamOutlivesResponseHeaderTimeout(t *testing.T) {
+	configureForTest(t, "*", 1) // one-second upstream timeout
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		flusher := w.(http.Flusher)
+		for i := 0; i < 6; i++ {
+			fmt.Fprintf(w, "chunk%d;", i)
+			flusher.Flush()
+			time.Sleep(250 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	resp, err := proxy.Client().Get(proxiedURL(proxy.URL, upstream.URL+"/radio.mp3"))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("stream broke after %q: %v", body, err)
+	}
+	if want := "chunk0;chunk1;chunk2;chunk3;chunk4;chunk5;"; string(body) != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+}
+
+func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
+	resetProxyState(t)
+
+	var upstreamHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHeaders = r.Header.Clone()
+		w.Header().Set("Connection", "X-Hop-Resp")
+		w.Header().Set("X-Hop-Resp", "1")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("Proxy-Authenticate", "Basic")
+		w.Header().Set("X-End-To-End", "resp")
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	resp, body := doProxy(t, proxy, "GET", upstream.URL+"/x", map[string]string{
+		"Connection":          "X-Hop-Req",
+		"X-Hop-Req":           "1",
+		"Keep-Alive":          "timeout=5",
+		"Proxy-Authorization": "Basic c2VjcmV0",
+		"X-End-To-End":        "req",
+	})
+	if body != "ok" {
+		t.Fatalf("body = %q", body)
+	}
+
+	for _, name := range []string{"X-Hop-Req", "Keep-Alive", "Proxy-Authorization"} {
+		if v := upstreamHeaders.Get(name); v != "" {
+			t.Errorf("request hop-by-hop header %s reached upstream: %q", name, v)
+		}
+	}
+	if strings.Contains(upstreamHeaders.Get("Connection"), "X-Hop-Req") {
+		t.Errorf("request Connection tokens reached upstream: %q", upstreamHeaders.Get("Connection"))
+	}
+	assertHeader(t, upstreamHeaders, "X-End-To-End", "req")
+
+	for _, name := range []string{"X-Hop-Resp", "Keep-Alive", "Proxy-Authenticate"} {
+		if v := resp.Header.Get(name); v != "" {
+			t.Errorf("response hop-by-hop header %s reached client: %q", name, v)
+		}
+	}
+	assertHeader(t, resp.Header, "X-End-To-End", "resp")
+}
+
+func TestRequestContentLengthIsNotEchoedAsResponseLength(t *testing.T) {
+	resetProxyState(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "received %q", got)
+		w.(http.Flusher).Flush() // force a length-less (chunked) response
+	}))
+	defer upstream.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+	defer proxy.Close()
+
+	resp, err := proxy.Client().Post(proxiedURL(proxy.URL, upstream.URL+"/echo"), "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	body := readResponseBody(t, resp)
+	if body != `received "hello"` {
+		t.Fatalf("body = %q", body)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl == "5" {
+		t.Fatalf("response echoed the request Content-Length")
+	}
+}
+
+func TestUpstreamFailureAfterHeadersAbortsTheResponse(t *testing.T) {
+	cases := []struct {
+		name          string
+		declaredBytes string
+	}{
+		{name: "chunked", declaredBytes: ""},
+		{name: "known length", declaredBytes: "100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetProxyState(t)
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				if tc.declaredBytes != "" {
+					w.Header().Set("Content-Length", tc.declaredBytes)
+				}
+				io.WriteString(w, "partial")
+				w.(http.Flusher).Flush()
+				panic(http.ErrAbortHandler)
+			}))
+			defer upstream.Close()
+			proxy := httptest.NewServer(http.HandlerFunc(proxyHandler))
+			defer proxy.Close()
+
+			resp, err := proxy.Client().Get(proxiedURL(proxy.URL, upstream.URL+"/file.bin"))
+			if err != nil {
+				t.Fatalf("request failed before headers: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				t.Fatalf("truncated upstream body %q ended cleanly; the proxy must abort the connection", body)
+			}
+			if string(body) != "partial" {
+				t.Fatalf("body = %q, want only the upstream bytes", body)
+			}
+		})
 	}
 }

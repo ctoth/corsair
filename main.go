@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -80,7 +81,7 @@ func init() {
 	flag.IntVar(&port, "port", getEnvAsInt("CORSAIR_PORT", 8080), "Port to run the proxy server on")
 	flag.StringVar(&listenAddr, "interface", getEnv("CORSAIR_INTERFACE", "localhost"), "Network interface to listen on")
 	flag.StringVar(&domains, "domains", getEnv("CORSAIR_DOMAINS", "*"), "Comma-separated list of allowed domains for forwarding, default to '*' for all")
-	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 0), "Timeout in seconds for HTTP client")
+	flag.IntVar(&timeout, "timeout", getEnvAsInt("CORSAIR_TIMEOUT", 0), "Seconds to wait for upstream response headers (0 = no limit); streamed bodies have no total deadline")
 	flag.IntVar(&cacheSize, "cache-size", getEnvAsInt("CORSAIR_CACHE_SIZE", 100), "Size of the cache")
 
 	prometheus.MustRegister(requestCounter, requestDuration, cacheHitCounter, cacheMissCounter)
@@ -130,8 +131,32 @@ func configure() {
 	}
 
 	clientTimeout = time.Duration(timeout) * time.Second
-	client = &http.Client{
-		Timeout:       clientTimeout,
+	client = newUpstreamClient(clientTimeout)
+}
+
+// newUpstreamClient builds the origin client. Live sources have no total body
+// deadline: the connection, TLS handshake and response headers are bounded,
+// and the request context ends the body when the client leaves. A zero
+// responseHeaderTimeout waits for headers indefinitely.
+func newUpstreamClient(responseHeaderTimeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		// Relay the origin's bytes untouched; transparent decompression
+		// would change lengths and byte-range coordinates.
+		DisableCompression: true,
+	}
+	return &http.Client{
+		Transport:     transport,
 		CheckRedirect: checkRedirect,
 	}
 }
@@ -205,12 +230,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if matchHeader(r, "If-None-Match", cachedEntry.etag) || matchHeader(r, "If-Modified-Since", cachedEntry.lastModified) {
-				copyHeaders(w.Header(), cachedEntry.headers)
+				copyResponseHeaders(w.Header(), cachedEntry.headers)
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
 
-			copyHeaders(w.Header(), cachedEntry.headers)
+			copyResponseHeaders(w.Header(), cachedEntry.headers)
 			w.WriteHeader(cachedEntry.statusCode)
 			w.Write(cachedEntry.content)
 			return
@@ -303,14 +328,20 @@ func upstreamErrorReason(err error) error {
 
 func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, useCache bool) {
 	targetURL := target.String()
-	req, err := http.NewRequest(r.Method, targetURL, r.Body)
+	var body io.Reader
+	if r.ContentLength != 0 {
+		body = r.Body
+	}
+	// Bound the upstream fetch to the client's request: a departing client
+	// cancels it.
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, body)
 	if err != nil {
 		log.Printf("Error creating request for %s: %v", redactURL(target), err)
 		http.Error(w, "Error creating upstream request", http.StatusInternalServerError)
 		return
 	}
-
-	copyHeaders(req.Header, r.Header)
+	req.ContentLength = r.ContentLength
+	req.Header = upstreamRequestHeaders(r.Header)
 
 	if useCache {
 		cacheMutex.RLock()
@@ -335,6 +366,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if r.Context().Err() != nil {
+			// The client left; there is nobody to answer and nothing failed.
+			log.Printf("Client disconnected before %s responded", redactURL(target))
+			return
+		}
 		reason := upstreamErrorReason(err)
 		log.Printf("Upstream request for %s failed: %v", redactURL(target), reason)
 		if errors.Is(reason, errRedirectNotAllowed) {
@@ -346,33 +382,77 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, target *url.URL, use
 	}
 	defer resp.Body.Close()
 
-	copyHeaders(w.Header(), resp.Header)
+	responseHeaders := upstreamResponseHeaders(resp)
+	copyResponseHeaders(w.Header(), responseHeaders)
 	w.WriteHeader(resp.StatusCode)
 
+	var captured *bytes.Buffer
 	if useCache && isCacheableResponse(resp) && !isStreamingResponse(resp) {
-		bodyBytes, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Error reading response body: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		captured = new(bytes.Buffer)
+	} else {
+		log.Printf("Streaming response for %s", redactURL(target))
+	}
+
+	if err := streamBody(w, resp.Body, captured); err != nil {
+		var writeErr *clientWriteError
+		if r.Context().Err() != nil || errors.As(err, &writeErr) {
+			log.Printf("Client disconnected while streaming %s", redactURL(target))
 			return
 		}
+		// Headers are already sent, so an error status is impossible. Abort
+		// the connection so the client sees a truncated response instead of
+		// a clean end or an error message appended to the body.
+		log.Printf("Error streaming response for %s: %v", redactURL(target), err)
+		panic(http.ErrAbortHandler)
+	}
 
+	if captured != nil {
 		cacheMutex.Lock()
 		cache.Add(targetURL, cacheEntry{
-			content:      bodyBytes,
-			headers:      cloneHeaders(resp.Header),
+			content:      captured.Bytes(),
+			headers:      responseHeaders,
 			statusCode:   resp.StatusCode,
 			etag:         resp.Header.Get("ETag"),
 			lastModified: resp.Header.Get("Last-Modified"),
 		})
 		cacheMutex.Unlock()
+	}
+}
 
-		w.Write(bodyBytes)
-	} else {
-		log.Printf("Streaming response for %s", redactURL(target))
-		_, copyErr := io.Copy(w, resp.Body)
-		if copyErr != nil {
-			log.Printf("Error streaming response for %s: %v", redactURL(target), copyErr)
+// streamBuffer is the copy buffer size for proxied bodies.
+const streamBuffer = 32 * 1024
+
+// clientWriteError marks a failure writing to the downstream client, as
+// opposed to reading from the upstream.
+type clientWriteError struct{ err error }
+
+func (e *clientWriteError) Error() string { return "write to client: " + e.err.Error() }
+func (e *clientWriteError) Unwrap() error { return e.err }
+
+// streamBody copies src to w through a bounded buffer, flushing after every
+// chunk so live and progressively loaded media reach the client promptly.
+// When capture is non-nil the bytes are also accumulated there.
+func streamBody(w http.ResponseWriter, src io.Reader, capture *bytes.Buffer) error {
+	controller := http.NewResponseController(w)
+	buf := make([]byte, streamBuffer)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, err := w.Write(buf[:n]); err != nil {
+				return &clientWriteError{err}
+			}
+			if err := controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				return &clientWriteError{err}
+			}
+			if capture != nil {
+				capture.Write(buf[:n])
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
 		}
 	}
 }
@@ -405,10 +485,7 @@ func isCacheableResponse(resp *http.Response) bool {
 }
 
 func isStreamingResponse(resp *http.Response) bool {
-	if _, ok := resp.Header["Content-Length"]; !ok {
-		return true
-	}
-	if resp.Header.Get("Transfer-Encoding") == "chunked" {
+	if resp.ContentLength < 0 {
 		return true
 	}
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "video/") ||
@@ -418,42 +495,82 @@ func isStreamingResponse(resp *http.Response) bool {
 	return false
 }
 
-func cloneHeaders(headers http.Header) http.Header {
-	cloned := make(http.Header, len(headers))
-	for key, values := range headers {
-		cloned[key] = append([]string(nil), values...)
-	}
-	return cloned
+// hopByHopHeaders are connection-scoped (RFC 9110 section 7.6.1) and are
+// never forwarded in either direction.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
 }
 
-func copyHeaders(dst, src http.Header) {
-	protectedHeaders := []string{"Host", "Content-Length", "Connection"}
-	// Upstream CORS headers (Access-Control-*) never override the proxy's policy.
-
-	isProtectedHeader := func(header string) bool {
-		for _, h := range protectedHeaders {
-			if strings.EqualFold(h, header) {
-				return true
+// removeHopByHopHeaders deletes the standard hop-by-hop headers and every
+// header named by a Connection header.
+func removeHopByHopHeaders(h http.Header) {
+	for _, value := range h.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
 			}
 		}
-		return false
 	}
-
-	isCorsHeader := func(header string) bool {
-		return strings.HasPrefix(http.CanonicalHeaderKey(header), "Access-Control-")
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
 	}
+}
 
-	for k, vv := range src {
-		if isCorsHeader(k) {
-			continue // Skip copying upstream CORS headers.
+// upstreamRequestHeaders derives the headers sent to the origin from the
+// client's request headers.
+func upstreamRequestHeaders(clientHeaders http.Header) http.Header {
+	h := clientHeaders.Clone()
+	if h == nil {
+		h = make(http.Header)
+	}
+	removeHopByHopHeaders(h)
+	// The outgoing request's own body and target determine these.
+	h.Del("Host")
+	h.Del("Content-Length")
+	// Compressed bytes do not share the coordinates of the byte range the
+	// client asked for.
+	if h.Get("Range") != "" || h.Get("If-Range") != "" {
+		h.Set("Accept-Encoding", "identity")
+	}
+	return h
+}
+
+// upstreamResponseHeaders returns the end-to-end headers of an origin
+// response that may be relayed to the client. Content-Length survives only
+// when the body bytes are relayed unchanged.
+func upstreamResponseHeaders(resp *http.Response) http.Header {
+	h := resp.Header.Clone()
+	if h == nil {
+		h = make(http.Header)
+	}
+	removeHopByHopHeaders(h)
+	for name := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
+			delete(h, name)
 		}
-		if !isProtectedHeader(k) {
-			dst[k] = vv
-		} else {
-			if _, exists := dst[k]; !exists {
-				dst[k] = vv
-			}
+	}
+	if resp.Uncompressed {
+		h.Del("Content-Length")
+	}
+	return h
+}
+
+// copyResponseHeaders copies relayable headers into dst. Upstream CORS
+// headers never override the proxy's own policy.
+func copyResponseHeaders(dst, src http.Header) {
+	for name, values := range src {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
+			continue
 		}
+		dst[name] = append([]string(nil), values...)
 	}
 }
 
