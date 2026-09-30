@@ -43,10 +43,6 @@ jobs:
         exclude:
           - goos: darwin
             goarch: arm
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: arm64
           # Go dropped windows/arm (unsupported GOOS/GOARCH pair)
           - goos: windows
             goarch: arm
