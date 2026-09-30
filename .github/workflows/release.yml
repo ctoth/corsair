@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: release
     strategy:
+      fail-fast: false
       matrix:
         goos:
           - darwin
@@ -46,6 +47,9 @@ jobs:
             goarch: arm64
           - goos: windows
             goarch: arm64
+          # Go dropped windows/arm (unsupported GOOS/GOARCH pair)
+          - goos: windows
+            goarch: arm
     steps:
     - name: Repository checkout
       uses: actions/checkout@v3
